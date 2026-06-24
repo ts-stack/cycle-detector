@@ -1,7 +1,10 @@
 {
   "name": "@ts-stack/cycle-detector",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.0.1",
+  "bin": {
+    "cycle-detector": "./dist/index.js"
+  },
   "description": "A fast, zero-dependency CLI tool to detect circular dependencies in TypeScript ESM projects, ignoring type-only imports.",
   "repository": "https://github.com/ts-stack/cycle-detector",
   "exports": {

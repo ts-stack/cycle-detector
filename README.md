@@ -23,3 +23,24 @@ npx @ts-stack/cycle-detector src/index.ts
 # OR
 npx @ts-stack/cycle-detector packages/*/src/index.ts
 ```
+
+Also you can install this utility locally:
+
+```bash
+npm install -D @ts-stack/cycle-detector
+```
+
+In your `package.json`:
+
+
+```json
+"scripts": {
+  "lint:cycles": "cycle-detector packages/*/src/index.ts"
+}
+```
+
+And then:
+
+```bash
+npm run lint:cycles
+```
