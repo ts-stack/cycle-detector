@@ -11,7 +11,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const TMP_DIR = path.resolve(PROJECT_ROOT, '__tmp_tests__');
 const CLI_PATH = path.resolve(PROJECT_ROOT, 'dist/index.js');
 
-describe('ts-cycle-detector CLI', () => {
+describe('cycle-detector CLI', () => {
   const originalCwd = process.cwd();
 
   beforeEach(() => {
