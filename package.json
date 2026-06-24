@@ -1,9 +1,9 @@
 {
-  "name": "starter",
+  "name": "@ts-stack/cycle-detector",
   "type": "module",
   "version": "1.0.0",
-  "description": "",
-  "repository": "https://github.com/ts-stack/starter",
+  "description": "A fast, zero-dependency CLI tool to detect circular dependencies in TypeScript ESM projects, ignoring type-only imports.",
+  "repository": "https://github.com/ts-stack/cycle-detector",
   "exports": {
     "./package.json": {
       "default": "./package.json"
@@ -18,18 +18,19 @@
   },
   "scripts": {
     "start": "npm run build && node dist/index.js",
-    "test": "npm run build && npm run esm-jest",
+    "test": "npm run build-test && npm run esm-jest",
     "esm-jest": "node --experimental-vm-modules --no-warnings=ExperimentalWarning node_modules/jest/bin/jest.js",
     "build": "tsc -b tsconfig.build.json",
+    "build-test": "tsc -b tsconfig.unit.json",
     "clean": "rimraf dist*"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["lint", "circular dependencies"],
+  "author": "Kostia Tretiak",
   "license": "MIT",
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/jest": "^29.5.14",
-    "@types/node": "^20.19.43",
+    "@types/node": "^26.0.0",
     "eslint": "^10.5.0",
     "jest": "^29.7.0",
     "nodemon": "^3.1.14",
@@ -40,6 +41,9 @@
     "typescript-eslint": "^8.62.0"
   },
   "engines": {
-    "node": ">= 20.6.0"
+    "node": ">= 22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

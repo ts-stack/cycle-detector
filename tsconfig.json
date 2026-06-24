@@ -1,18 +1,19 @@
 {
   "compilerOptions": {
+    "outDir": "dist",
     "strict": true,
+    "types": ["node", "jest"],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "declaration": true,
     "declarationMap": true,
-    "composite": true,
-    "outDir": "dist",
     "sourceMap": true,
+    "composite": true,
     "noImplicitOverride": true,
     "forceConsistentCasingInFileNames": true,
     "noImplicitReturns": true,
     "skipLibCheck": true,
-    "target": "es2022",
+    "target": "esnext",
     "strictPropertyInitialization": false,
     "noImplicitAny": true,
     "emitDecoratorMetadata": true,
@@ -24,6 +25,7 @@
   },
   "include": [
     "src",
-    "test"
+    "test",
+    "packages/*/src",
   ]
 }
