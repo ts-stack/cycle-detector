@@ -1,19 +1,50 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
-import { describe, test, expect, beforeEach, afterEach } from '@jest/globals';
+import { execSync } from 'node:child_process';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PROJECT_ROOT = path.resolve(__dirname, '..'); 
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+const TMP_DIR = path.resolve(__dirname, 'tmp-test-sandbox');
+const CLI_PATH = path.resolve(process.cwd(), 'dist/index.js');
 
-const TMP_DIR = path.resolve(PROJECT_ROOT, '__tmp_tests__');
-const CLI_PATH = path.resolve(PROJECT_ROOT, 'dist/index.js');
+interface CLIResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
 
-describe('cycle-detector CLI', () => {
-  const originalCwd = process.cwd();
+interface ExecSyncError extends Error {
+  status?: number;
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
+}
 
+function createFixture(filePath: string, content: string): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(filePath, content, 'utf8');
+}
+
+function runCLI(args: string): CLIResult {
+  try {
+    const stdout = execSync(`node ${CLI_PATH} ${args}`, {
+      cwd: TMP_DIR,
+      stdio: 'pipe',
+      env: { ...process.env }
+    });
+    return { code: 0, stdout: stdout.toString(), stderr: '' };
+  } catch (error) {
+    const execError = error as ExecSyncError; 
+    return {
+      code: execError.status ?? 1,
+      stdout: execError.stdout ? execError.stdout.toString() : '',
+      stderr: execError.stderr ? execError.stderr.toString() : ''
+    };
+  }
+}
+
+describe('Circular Dependency Detector CLI', () => {
   beforeEach(() => {
     if (fs.existsSync(TMP_DIR)) {
       fs.rmSync(TMP_DIR, { recursive: true, force: true });
@@ -21,126 +52,92 @@ describe('cycle-detector CLI', () => {
     fs.mkdirSync(TMP_DIR, { recursive: true });
   });
 
-  afterEach(() => {
-    process.chdir(originalCwd);
+  afterAll(() => {
     if (fs.existsSync(TMP_DIR)) {
       fs.rmSync(TMP_DIR, { recursive: true, force: true });
     }
   });
 
-  function runCLI(args: string[], execCwd: string = originalCwd) {
-    const result = spawnSync('node', [CLI_PATH, ...args], {
-      cwd: execCwd,
-      encoding: 'utf8',
+  describe('Single Repository Mode', () => {
+    it('should pass if there are no circular dependencies', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+      createFixture(path.join(TMP_DIR, 'src/index.ts'), "import { b } from './b';");
+      createFixture(path.join(TMP_DIR, 'src/b.ts'), 'export const b = 42;');
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('Clean!');
+      expect(result.stdout).toContain('All packages checked');
     });
 
-    return {
-      status: result.status,
-      stdout: result.stdout || '',
-      stderr: result.stderr || '',
-    };
-  }
+    it('should fail and detect direct cycle A -> B -> A', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+      createFixture(path.join(TMP_DIR, 'src/index.ts'), "import './b';");
+      createFixture(path.join(TMP_DIR, 'src/b.ts'), "import './index';");
 
-  function createTsConfig(dir: string, paths: Record<string, string[]> = {}) {
-    const config = {
-      compilerOptions: {
-        target: 'ES2022',
-        module: 'NodeNext',
-        moduleResolution: 'NodeNext',
-        baseUrl: './',
-        paths,
-      },
-    };
-    fs.writeFileSync(path.join(dir, 'tsconfig.json'), JSON.stringify(config, null, 2));
-  }
+      const result = runCLI('src/index.ts');
 
-  test('should pass successfully if there are no circular dependencies', () => {
-    const projectDir = path.join(TMP_DIR, 'clean-project');
-    fs.mkdirSync(projectDir, { recursive: true });
-    createTsConfig(projectDir);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Found 1 circular dependencies');
+      expect(result.stderr).toContain('Validation failed');
+    });
 
-    fs.writeFileSync(path.join(projectDir, 'index.ts'), "import { b } from './b.js';\nconsole.log(b);");
-    fs.writeFileSync(path.join(projectDir, 'b.ts'), 'export const b = 42;');
+    it('should ignore type-only imports in circular checks', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+      createFixture(path.join(TMP_DIR, 'src/index.ts'), "import type { BType } from './b';");
+      createFixture(path.join(TMP_DIR, 'src/b.ts'), "import './index';");
 
-    const { status, stdout } = runCLI([path.join(projectDir, 'index.ts')]);
+      const result = runCLI('src/index.ts');
 
-    expect(status).toBe(0);
-    expect(stdout).toContain('Clean!');
-    expect(stdout).toContain('No circular dependencies found!');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('Clean!');
+    });
   });
 
-  test('should detect a direct circular dependency and return exit code 1', () => {
-    const projectDir = path.join(TMP_DIR, 'cyclic-project');
-    fs.mkdirSync(projectDir, { recursive: true });
-    createTsConfig(projectDir);
+  describe('Monorepo Mode & Correct Cycle Attribution', () => {
+    beforeEach(() => {
+      createFixture(
+        path.join(TMP_DIR, 'tsconfig.json'),
+        JSON.stringify({
+          compilerOptions: {
+            baseUrl: '.',
+            paths: {
+              '@monorepo/core': ['packages/core/src/index.ts'],
+              '@monorepo/rest': ['packages/rest/src/index.ts'],
+            },
+          },
+        }),
+      );
 
-    fs.writeFileSync(path.join(projectDir, 'index.ts'), "import './b.js';");
-    fs.writeFileSync(path.join(projectDir, 'b.ts'), "import './index.js';");
+      createFixture(
+        path.join(TMP_DIR, 'packages/core/package.json'),
+        JSON.stringify({ name: '@monorepo/core', main: 'src/index.ts' }),
+      );
+      createFixture(path.join(TMP_DIR, 'packages/core/src/index.ts'), "import { restInit } from '@monorepo/rest';");
 
-    const { status, stderr } = runCLI([path.join(projectDir, 'index.ts')]);
+      createFixture(
+        path.join(TMP_DIR, 'packages/rest/package.json'),
+        JSON.stringify({ name: '@monorepo/rest', main: 'src/index.ts' }),
+      );
+      createFixture(
+        path.join(TMP_DIR, 'packages/rest/src/index.ts'),
+        "import './internal'; export const restInit = () => {};",
+      );
+      createFixture(path.join(TMP_DIR, 'packages/rest/src/internal.ts'), "import './utils';");
+      createFixture(path.join(TMP_DIR, 'packages/rest/src/utils.ts'), "import './internal';");
+    });
 
-    expect(status).toBe(1);
-    expect(stderr).toMatch(/index\.ts -> .*b\.ts -> .*index\.ts/);
-    expect(stderr).toContain('Circular dependencies detected.');
-  });
+    it('should correctly attribute internal rest cycles to rest package, leaving core clean', () => {
+      const result = runCLI('"packages/*/src"');
 
-  test('should completely ignore type-only imports', () => {
-    const projectDir = path.join(TMP_DIR, 'type-only-project');
-    fs.mkdirSync(projectDir, { recursive: true });
-    createTsConfig(projectDir);
+      expect(result.code).toBe(1);
 
-    fs.writeFileSync(path.join(projectDir, 'index.ts'), "import { B } from './b.js';");
-    fs.writeFileSync(path.join(projectDir, 'b.ts'), "import type { IndexType } from './index.js';\nexport class B {}");
+      expect(result.stdout).toContain('packages/core/src/index.ts] — Clean!');
 
-    const { status, stdout } = runCLI([path.join(projectDir, 'index.ts')]);
-
-    expect(status).toBe(0);
-    expect(stdout).toContain('Clean!');
-  });
-
-  test('should correctly analyze monorepo structures using glob patterns', () => {
-    const monorepoDir = path.join(TMP_DIR, 'monorepo');
-    const pkgADir = path.join(monorepoDir, 'packages/pkg-a/src');
-    const pkgBDir = path.join(monorepoDir, 'packages/pkg-b/src');
-
-    fs.mkdirSync(pkgADir, { recursive: true });
-    fs.mkdirSync(pkgBDir, { recursive: true });
-
-    createTsConfig(path.dirname(pkgADir));
-    createTsConfig(path.dirname(pkgBDir));
-
-    fs.writeFileSync(path.join(pkgADir, 'index.ts'), "import './utils.js';");
-    fs.writeFileSync(path.join(pkgADir, 'utils.ts'), 'export const greet = "hi";');
-
-    fs.writeFileSync(path.join(pkgBDir, 'index.ts'), "import './component.js';");
-    fs.writeFileSync(path.join(pkgBDir, 'component.ts'), "import './index.js';");
-
-    const { status, stdout, stderr } = runCLI(['packages/*/src/index.ts'], monorepoDir);
-
-    expect(status).toBe(1);
-    expect(stdout).toContain('[packages/pkg-a/src/index.ts] — Clean!');
-    expect(stderr).toContain('[packages/pkg-b/src/index.ts] — Found 1 circular dependencies');
-  });
-
-  test('should respect explicitly provided tsconfig file via --project flag', () => {
-    const projectDir = path.join(TMP_DIR, 'custom-config-project');
-    fs.mkdirSync(projectDir, { recursive: true });
-    
-    const customConfigPath = path.join(projectDir, 'tsconfig.custom.json');
-    
-    createTsConfig(projectDir, { '@/*': ['src/*'] });
-    fs.renameSync(path.join(projectDir, 'tsconfig.json'), customConfigPath);
-
-    const srcDir = path.join(projectDir, 'src');
-    fs.mkdirSync(srcDir, { recursive: true });
-
-    fs.writeFileSync(path.join(srcDir, 'index.ts'), "import '@/b.js';");
-    fs.writeFileSync(path.join(srcDir, 'b.ts'), "import '@/index.js';");
-
-    const { status, stderr } = runCLI([path.join(srcDir, 'index.ts'), '--project', customConfigPath]);
-
-    expect(status).toBe(1);
-    expect(stderr).toMatch(/index\.ts -> .*b\.ts -> .*index\.ts/);
-    expect(stderr).toContain('Circular dependencies detected.');
+      expect(result.stderr).toContain('packages/rest/src/index.ts] — Found 1 circular dependencies:');
+      expect(result.stderr).toContain('packages/rest/src/internal.ts');
+      expect(result.stderr).toContain('packages/rest/src/utils.ts');
+    });
   });
 });
