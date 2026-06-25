@@ -31,15 +31,15 @@ function runCLI(args: string): CLIResult {
     const stdout = execSync(`node ${CLI_PATH} ${args}`, {
       cwd: TMP_DIR,
       stdio: 'pipe',
-      env: { ...process.env }
+      env: { ...process.env },
     });
     return { code: 0, stdout: stdout.toString(), stderr: '' };
   } catch (error) {
-    const execError = error as ExecSyncError; 
+    const execError = error as ExecSyncError;
     return {
       code: execError.status ?? 1,
       stdout: execError.stdout ? execError.stdout.toString() : '',
-      stderr: execError.stderr ? execError.stderr.toString() : ''
+      stderr: execError.stderr ? execError.stderr.toString() : '',
     };
   }
 }
@@ -79,7 +79,7 @@ describe('Circular Dependency Detector CLI', () => {
       const result = runCLI('src/index.ts');
 
       expect(result.code).toBe(1);
-      expect(result.stderr).toContain('Found 1 circular dependencies');
+      expect(result.stderr).toContain('Found 1 critical circular dependencies');
       expect(result.stderr).toContain('Validation failed');
     });
 
@@ -135,9 +135,46 @@ describe('Circular Dependency Detector CLI', () => {
 
       expect(result.stdout).toContain('packages/core/src/index.ts] — Clean!');
 
-      expect(result.stderr).toContain('packages/rest/src/index.ts] — Found 1 circular dependencies:');
+      expect(result.stderr).toContain('packages/rest/src/index.ts] — Found 1 critical circular dependencies:');
       expect(result.stderr).toContain('packages/rest/src/internal.ts');
       expect(result.stderr).toContain('packages/rest/src/utils.ts');
+    });
+  });
+
+  describe('Class Fields Evaluation (Lazy vs Static)', () => {
+    it('should pass (Clean) if a cycle goes through a non-static class property', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts (лінивий виклик через функцію)
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import { B } from './b'; export function getB() { return B; }",
+      );
+      // b.ts -> index.ts (лінивий виклик через звичайну властивість інстансу класу)
+      createFixture(path.join(TMP_DIR, 'src/b.ts'), "import { A } from './index'; export class B { prop = A; }");
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('Clean!');
+    });
+
+    it('should fail (Critical) if a cycle goes through a static class property', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts (лінивий виклик через функцію)
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import { B } from './b'; export function getB() { return B; }",
+      );
+      // b.ts -> index.ts (КРИТИЧНИЙ виклик, бо static виконується top-level в момент імпорту)
+      createFixture(path.join(TMP_DIR, 'src/b.ts'), "import { A } from './index'; export class B { static prop = A; }");
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Critical circular dependencies detected');
+      expect(result.stderr).toContain('Validation failed');
     });
   });
 });

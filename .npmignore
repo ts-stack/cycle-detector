@@ -11,3 +11,4 @@ tsconfig.*
 test
 tests
 dist-*
+eslint.config.mjs

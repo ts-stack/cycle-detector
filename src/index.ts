@@ -233,8 +233,124 @@ function parseFile(filePath: string) {
 }
 
 /**
- * Checks if a specific target file is reachable from a starting entry point in the graph.
+ * Checks if a specific file import creates an immediate execution (top-level) risk.
  */
+function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
+  if (!fs.existsSync(fromFile)) return false;
+
+  const options = getCompilerOptionsForFile(fromFile);
+  const content = fs.readFileSync(fromFile, 'utf8');
+  const sourceFile = ts.createSourceFile(fromFile, content, ts.ScriptTarget.Latest, true);
+
+  const importedSymbols = new Set<string>();
+  let hasSideEffectOrReExport = false;
+
+  // 1. Collect all names imported from 'toFile'
+  function findImports(node: ts.Node) {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (isRuntimeImport(node)) {
+        const specifier = node.moduleSpecifier;
+        if (specifier && ts.isStringLiteral(specifier)) {
+          const resolved = resolveModule(specifier.text, fromFile, options);
+          if (resolved === toFile) {
+            if (ts.isImportDeclaration(node) && node.importClause) {
+              const clause = node.importClause;
+              if (clause.name) importedSymbols.add(clause.name.text); // default import
+              if (clause.namedBindings) {
+                if (ts.isNamespaceImport(clause.namedBindings)) {
+                  importedSymbols.add(clause.namedBindings.name.text); // import * as namespace
+                } else if (ts.isNamedImports(clause.namedBindings)) {
+                  for (const el of clause.namedBindings.elements) {
+                    importedSymbols.add(el.name.text); // named imports
+                  }
+                }
+              }
+            } else {
+              // Re-exports (export * from...) or side-effect imports (import './file') 
+              // trigger top-level evaluation instantly.
+              hasSideEffectOrReExport = true;
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, findImports);
+  }
+
+  findImports(sourceFile);
+
+  if (hasSideEffectOrReExport) return true;
+  if (importedSymbols.size === 0) return false;
+
+  let dangerousTopLevelUsage = false;
+
+  // 2. Check if collected symbols are used outside of lazy blocks (functions/methods)
+  function checkNodeUsage(node: ts.Node, isInsideLazyScope: boolean) {
+  if (dangerousTopLevelUsage) return;
+
+  let currentScopeLazy = isInsideLazyScope;
+
+  if (
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node)
+  ) {
+    currentScopeLazy = true;
+  }
+
+  if (ts.isPropertyDeclaration(node)) {
+    const isStatic = node.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword);
+    if (!isStatic) {
+      currentScopeLazy = true; 
+    }
+  }
+
+  if (!currentScopeLazy && ts.isIdentifier(node)) {
+    if (importedSymbols.has(node.text)) {
+      const parent = node.parent;
+      
+        // Verify it's an actual usage reference, not the import clause definition itself
+      const isImportDeclarationRef = 
+        ts.isImportSpecifier(parent) || 
+        ts.isImportClause(parent) || 
+        ts.isNamespaceImport(parent);
+
+      if (!isImportDeclarationRef) {
+          // Verify it's not just a TypeScript Type usage context (which is safe in runtime)
+        let isInTypeContext = false;
+        let checkParent: ts.Node | undefined = parent;
+        while (checkParent && checkParent !== sourceFile) {
+          if (
+            ts.isTypeNode(checkParent) || 
+            ts.isTypeReferenceNode(checkParent) || 
+            ts.isTypeAliasDeclaration(checkParent) || 
+            ts.isInterfaceDeclaration(checkParent)
+          ) {
+            isInTypeContext = true;
+            break;
+          }
+          checkParent = checkParent.parent;
+        }
+
+        if (!isInTypeContext) {
+          dangerousTopLevelUsage = true;
+          return;
+        }
+      }
+    }
+  }
+
+  ts.forEachChild(node, (n) => checkNodeUsage(n, currentScopeLazy));
+}
+
+  checkNodeUsage(sourceFile, false);
+  return dangerousTopLevelUsage;
+}
+
 function canReach(start: string, target: string): boolean {
   const seen = new Set<string>();
   const stack = [start];
@@ -329,16 +445,34 @@ function main() {
     }
   }
 
-  // Phase 3: Intelligently distribute and attribute cycles to their native entry points
+  // Phase 2.5: Smart AST Filtering (Filter out runtime-safe / lazy cycles)
+  const criticalCycles: string[][] = [];
+
+  for (const cycle of allUniqueCycles) {
+    let isHarmfulCycle = false;
+
+    // A cycle is harmful if AT LEAST ONE link in it uses imports on top-level
+    for (let i = 0; i < cycle.length - 1; i++) {
+      if (hasTopLevelUsage(cycle[i], cycle[i + 1])) {
+        isHarmfulCycle = true;
+        break;
+      }
+    }
+
+    if (isHarmfulCycle) {
+      criticalCycles.push(cycle);
+    }
+  }
+
+  // Phase 3: Intelligently distribute critical cycles to their native entry points
   const entryPointCycles = new Map<string, string[][]>();
   for (const ep of entryPoints) {
     entryPointCycles.set(ep, []);
   }
 
-  for (const cycle of allUniqueCycles) {
+  for (const cycle of criticalCycles) {
     const firstFile = cycle[0];
 
-    // Find the entrypoint whose source folder directly hosts this file
     const matchedEp = entryPoints.find((ep) => {
       const epDir = path.dirname(ep);
       return firstFile.startsWith(epDir + path.sep) || firstFile === ep;
@@ -347,7 +481,6 @@ function main() {
     if (matchedEp) {
       entryPointCycles.get(matchedEp)!.push(cycle);
     } else {
-      // Cross-package cycle or edge case: assign to the first entry point that can reach it
       const reachingEp = entryPoints.find((ep) => canReach(ep, firstFile));
       if (reachingEp) {
         entryPointCycles.get(reachingEp)!.push(cycle);
@@ -366,7 +499,7 @@ function main() {
 
     if (cycles.length > 0) {
       globalHasCycles = true;
-      console.error(`❌ [${absoluteEntry}] — Found ${cycles.length} circular dependencies:`);
+      console.error(`❌ [${absoluteEntry}] — Found ${cycles.length} critical circular dependencies:`);
       cycles.forEach((cycle, index) => {
         const readableCycle = cycle.map((p) => path.resolve(p)).join('\n     -> ');
         console.error(`  ${index + 1}) ${readableCycle}`);
@@ -377,11 +510,11 @@ function main() {
     }
   }
 
-  if (globalHasCycles || globalDetectedCycles.size > 0) {
-    console.error('💥 Validation failed. Circular dependencies detected.');
+  if (globalHasCycles || criticalCycles.length > 0) {
+    console.error('💥 Validation failed. Critical circular dependencies detected.');
     process.exit(1);
   } else {
-    console.log('🎉 All packages checked. No circular dependencies found!');
+    console.log('🎉 All packages checked. No critical circular dependencies found!');
     process.exit(0);
   }
 }
