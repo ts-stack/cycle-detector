@@ -1,8 +1,6 @@
 # Execution-Aware Circular Dependency Detector for TypeScript
 
-`@ts-stac/cycle-detector` - this is a high-performance static analysis utility powered by the native TypeScript Compiler API. Unlike generic dependency visualizers, this tool evaluates the **runtime execution risk** of circular dependencies in monorepos and complex TypeScript applications, isolating architectural flaws from safe, deferred imports.
-
----
+`@ts-stack/cycle-detector` - this is a high-performance static analysis utility powered by the native TypeScript Compiler API. Unlike generic dependency visualizers, this tool evaluates the **runtime execution risk** of circular dependencies in monorepos and complex TypeScript applications, isolating architectural flaws from safe, deferred imports.
 
 ## Installation & Usage
 
@@ -14,7 +12,7 @@ npx @ts-stack/cycle-detector src/index.ts
 npx @ts-stack/cycle-detector packages/*/src/index.ts
 ```
 
-Also you can install this utility locally:
+But you can install it locally:
 
 ```bash
 npm install -D @ts-stack/cycle-detector
@@ -35,24 +33,10 @@ And then:
 npm run lint:cycles
 ```
 
-### Execution
-
-```bash
-npx @ts-stack/cycle-detector <entry-patterns> [options]
-```
-
 ### Arguments & Flags
 
 * `<entry-patterns>`: Glob patterns or paths to entry point files (e.g., `packages/*/src/index.ts`).
 * `-p, --project <path>`: Path to your root or fallback `tsconfig.json`.
-
-### Example Command
-
-```bash
-npx @ts-stack/cycle-detector packages/*/src/index.ts
-```
-
----
 
 ## Interpreting Diagnostics
 
@@ -72,14 +56,10 @@ When a breaking circular dependency is detected, the script identifies exactly *
 
 The log indicates that `/packages/rest/src/init/rest.module.ts` contains an immediate top-level expression (such as an active decorator evaluation or configuration factory instantiation) that forces the evaluation of `routes.extension.ts` before the module evaluation of `rest.module.ts` is complete. To fix this, extract the shared configuration metadata or decorator targets into a dedicated initialization file positioned lower in the dependency hierarchy.
 
----
-
 ## Exit Codes
 
 * `0`: Success. Clean graph or only safe, runtime-deferred cyclic references found.
 * `1`: Critical Top-level execution loops found. Build terminated.
-
----
 
 ## Why Use This Over Existing Solutions?
 
@@ -92,14 +72,12 @@ In large-scale TypeScript applications (especially those utilizing Dependency In
 
 ### Technical Differentiators
 
-| Feature | @ts-stac/cycle-detector | Traditional Tools (e.g., Madge) | ESLint Rules |
+| Feature | @ts-stack/cycle-detector | Traditional Tools (e.g., Madge) | ESLint Rules |
 | --- | --- | --- | --- |
 | **Analysis Scope** | Execution-aware (Top-level vs. Lazy) | Pure Import Graph Topology | Token-based / File Boundary |
 | **TypeScript Engine** | Native `typescript` Compiler API | Pre-bundled bundlers / Regex | AST Walkers (without Full Type Context) |
 | **Monorepo Mapping** | Dynamic `package.json` -> `src` tracking | Requires complex path mapping config | Scoped only to single-package roots |
 | **Signal-to-Noise Ratio** | High (Flags only breaking cycles) | Low (Floods with safe runtime loops) | High overhead / Slow parsing |
-
----
 
 ## Core Architecture & Technical Details
 
@@ -119,8 +97,6 @@ In monorepos, internal package dependencies often resolve to `node_modules/<loca
 ### 3. Canonical Cycle Deduplication
 
 To prevent log flooding from deeply nested structural loops, the DFS (Depth-First Search) cycle collector normalizes all found paths into a canonical key based on lexicographical rotation. You see each unique cycle exactly once, regardless of which file initiated the traversal.
-
----
 
 ## How It Works Under the Hood
 
