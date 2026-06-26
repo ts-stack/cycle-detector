@@ -4,6 +4,83 @@
 
 ---
 
+## Installation & Usage
+
+You don't even need to install it! Just run it via `npx`:
+
+```bash
+npx @ts-stack/cycle-detector src/index.ts
+# OR
+npx @ts-stack/cycle-detector packages/*/src/index.ts
+```
+
+Also you can install this utility locally:
+
+```bash
+npm install -D @ts-stack/cycle-detector
+```
+
+In your `package.json`:
+
+
+```json
+"scripts": {
+  "lint:cycles": "cycle-detector packages/*/src/index.ts"
+}
+```
+
+And then:
+
+```bash
+npm run lint:cycles
+```
+
+### Execution
+
+```bash
+npx @ts-stack/cycle-detector <entry-patterns> [options]
+```
+
+### Arguments & Flags
+
+* `<entry-patterns>`: Glob patterns or paths to entry point files (e.g., `packages/*/src/index.ts`).
+* `-p, --project <path>`: Path to your root or fallback `tsconfig.json`.
+
+### Example Command
+
+```bash
+npx @ts-stack/cycle-detector packages/*/src/index.ts
+```
+
+---
+
+## Interpreting Diagnostics
+
+When a breaking circular dependency is detected, the script identifies exactly **which file executes the token prematurely**, leaving non-blocking files clearly marked.
+
+```txt
+❌ [/packages/rest/src/index.ts] — Found 1 critical circular dependencies:
+  1) --------------------------------------------------------------------------------
+  ⏳ [Lazy]      /srv/git/ditsmod/ditsmod/packages/rest/src/extensions/routes.extension.ts
+  ⏳ [Lazy]      /srv/git/ditsmod/ditsmod/packages/rest/src/decorators/rest-init-hooks-and-metadata.ts
+  💥 [Top-level] /srv/git/ditsmod/ditsmod/packages/rest/src/init/rest.module.ts
+
+💥 Validation failed. Critical circular dependencies detected.
+```
+
+### How to Refactor Based on the Log Above:
+
+The log indicates that `/packages/rest/src/init/rest.module.ts` contains an immediate top-level expression (such as an active decorator evaluation or configuration factory instantiation) that forces the evaluation of `routes.extension.ts` before the module evaluation of `rest.module.ts` is complete. To fix this, extract the shared configuration metadata or decorator targets into a dedicated initialization file positioned lower in the dependency hierarchy.
+
+---
+
+## Exit Codes
+
+* `0`: Success. Clean graph or only safe, runtime-deferred cyclic references found.
+* `1`: Critical Top-level execution loops found. Build terminated.
+
+---
+
 ## Why Use This Over Existing Solutions?
 
 Popular tools like `madge` or generic ESLint rules (`eslint-plugin-import`) operate solely at the graph-theory level: if **File A** imports **File B** and **File B** imports **File A**, an error is flagged.
@@ -55,53 +132,3 @@ To prevent log flooding from deeply nested structural loops, the DFS (Depth-Firs
 2. **Phase 2: Graph Traversal:** Runs a non-recursive path collector detecting back-edges.
 3. **Phase 3: Scope Validation:** For every edge in a detected cycle, it inspects whether the consumer node executes the imported token outside an execution-deferred scope block.
 4. **Phase 4: Targeted Diagnostics:** Groups and outputs anomalies based on the entry point package context.
-
----
-
-## Installation & Usage
-
-No configuration files are required. The script extracts metadata directly from your local environment.
-
-### Execution
-
-```bash
-npx @ts-stack/cycle-detector <entry-patterns> [options]
-```
-
-### Arguments & Flags
-
-* `<entry-patterns>`: Glob patterns or paths to entry point files (e.g., `packages/*/src/index.ts`).
-* `-p, --project <path>`: Path to your root or fallback `tsconfig.json`.
-
-### Example Command
-
-```bash
-npx @ts-stack/cycle-detector packages/*/src/index.ts
-```
-
----
-
-## Interpreting Diagnostics
-
-When a breaking circular dependency is detected, the script identifies exactly **which file executes the token prematurely**, leaving non-blocking files clearly marked.
-
-```txt
-❌ [/packages/rest/src/index.ts] — Found 1 critical circular dependencies:
-  1) --------------------------------------------------------------------------------
-  ⏳ [Lazy]      /srv/git/ditsmod/ditsmod/packages/rest/src/extensions/routes.extension.ts
-  ⏳ [Lazy]      /srv/git/ditsmod/ditsmod/packages/rest/src/decorators/rest-init-hooks-and-metadata.ts
-  💥 [Top-level] /srv/git/ditsmod/ditsmod/packages/rest/src/init/rest.module.ts
-
-💥 Validation failed. Critical circular dependencies detected.
-```
-
-### How to Refactor Based on the Log Above:
-
-The log indicates that `/packages/rest/src/init/rest.module.ts` contains an immediate top-level expression (such as an active decorator evaluation or configuration factory instantiation) that forces the evaluation of `routes.extension.ts` before the module evaluation of `rest.module.ts` is complete. To fix this, extract the shared configuration metadata or decorator targets into a dedicated initialization file positioned lower in the dependency hierarchy.
-
----
-
-## Exit Codes
-
-* `0`: Success. Clean graph or only safe, runtime-deferred cyclic references found.
-* `1`: Critical Top-level execution loops found. Build terminated.
