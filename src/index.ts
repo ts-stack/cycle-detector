@@ -245,7 +245,6 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   const importedSymbols = new Set<string>();
   let hasSideEffectOrReExport = false;
 
-  // 1. Collect all names imported from 'toFile'
   function findImports(node: ts.Node) {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       if (isRuntimeImport(node)) {
@@ -255,19 +254,17 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
           if (resolved === toFile) {
             if (ts.isImportDeclaration(node) && node.importClause) {
               const clause = node.importClause;
-              if (clause.name) importedSymbols.add(clause.name.text); // default import
+              if (clause.name) importedSymbols.add(clause.name.text);
               if (clause.namedBindings) {
                 if (ts.isNamespaceImport(clause.namedBindings)) {
-                  importedSymbols.add(clause.namedBindings.name.text); // import * as namespace
+                  importedSymbols.add(clause.namedBindings.name.text);
                 } else if (ts.isNamedImports(clause.namedBindings)) {
                   for (const el of clause.namedBindings.elements) {
-                    importedSymbols.add(el.name.text); // named imports
+                    importedSymbols.add(el.name.text);
                   }
                 }
               }
             } else {
-              // Re-exports (export * from...) or side-effect imports (import './file') 
-              // trigger top-level evaluation instantly.
               hasSideEffectOrReExport = true;
             }
           }
@@ -284,68 +281,65 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
 
   let dangerousTopLevelUsage = false;
 
-  // 2. Check if collected symbols are used outside of lazy blocks (functions/methods)
   function checkNodeUsage(node: ts.Node, isInsideLazyScope: boolean) {
-  if (dangerousTopLevelUsage) return;
+    if (dangerousTopLevelUsage) return;
 
-  let currentScopeLazy = isInsideLazyScope;
+    let currentScopeLazy = isInsideLazyScope;
 
-  if (
-    ts.isFunctionDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) ||
-    ts.isMethodDeclaration(node) ||
-    ts.isConstructorDeclaration(node) ||
-    ts.isGetAccessorDeclaration(node) ||
-    ts.isSetAccessorDeclaration(node)
-  ) {
-    currentScopeLazy = true;
-  }
-
-  if (ts.isPropertyDeclaration(node)) {
-    const isStatic = node.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword);
-    if (!isStatic) {
-      currentScopeLazy = true; 
+    if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)
+    ) {
+      currentScopeLazy = true;
     }
-  }
 
-  if (!currentScopeLazy && ts.isIdentifier(node)) {
-    if (importedSymbols.has(node.text)) {
-      const parent = node.parent;
-      
-        // Verify it's an actual usage reference, not the import clause definition itself
-      const isImportDeclarationRef = 
-        ts.isImportSpecifier(parent) || 
-        ts.isImportClause(parent) || 
-        ts.isNamespaceImport(parent);
+    if (ts.isPropertyDeclaration(node)) {
+      const isStatic = node.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword);
+      if (!isStatic) {
+        currentScopeLazy = true; 
+      }
+    }
 
-      if (!isImportDeclarationRef) {
-          // Verify it's not just a TypeScript Type usage context (which is safe in runtime)
-        let isInTypeContext = false;
-        let checkParent: ts.Node | undefined = parent;
-        while (checkParent && checkParent !== sourceFile) {
-          if (
-            ts.isTypeNode(checkParent) || 
-            ts.isTypeReferenceNode(checkParent) || 
-            ts.isTypeAliasDeclaration(checkParent) || 
-            ts.isInterfaceDeclaration(checkParent)
-          ) {
-            isInTypeContext = true;
-            break;
+    if (!currentScopeLazy && ts.isIdentifier(node)) {
+      if (importedSymbols.has(node.text)) {
+        const parent = node.parent;
+        
+        const isImportDeclarationRef = 
+          ts.isImportSpecifier(parent) || 
+          ts.isImportClause(parent) || 
+          ts.isNamespaceImport(parent);
+
+        if (!isImportDeclarationRef) {
+          let isInTypeContext = false;
+          let checkParent: ts.Node | undefined = parent;
+          while (checkParent && checkParent !== sourceFile) {
+            if (
+              ts.isTypeNode(checkParent) || 
+              ts.isTypeReferenceNode(checkParent) || 
+              ts.isTypeAliasDeclaration(checkParent) || 
+              ts.isInterfaceDeclaration(checkParent)
+            ) {
+              isInTypeContext = true;
+              break;
+            }
+            checkParent = checkParent.parent;
           }
-          checkParent = checkParent.parent;
-        }
 
-        if (!isInTypeContext) {
-          dangerousTopLevelUsage = true;
-          return;
+          if (!isInTypeContext) {
+            dangerousTopLevelUsage = true;
+            return;
+          }
         }
       }
     }
-  }
 
-  ts.forEachChild(node, (n) => checkNodeUsage(n, currentScopeLazy));
-}
+    ts.forEachChild(node, (n) => checkNodeUsage(n, currentScopeLazy));
+  }
 
   checkNodeUsage(sourceFile, false);
   return dangerousTopLevelUsage;
@@ -405,12 +399,10 @@ function main() {
 
   console.log(`🔍 Found ${entryPoints.length} entry point(s) for analysis. Building graph...\n`);
 
-  // Phase 1: Deep parse all files globally across all entry points
   for (const entryPoint of entryPoints) {
     parseFile(entryPoint);
   }
 
-  // Phase 2: Traverse the global graph to discover all unique cycles
   const visited = new Map<string, NodeState>();
   const currentStack: string[] = [];
 
@@ -445,13 +437,11 @@ function main() {
     }
   }
 
-  // Phase 2.5: Smart AST Filtering (Filter out runtime-safe / lazy cycles)
   const criticalCycles: string[][] = [];
 
   for (const cycle of allUniqueCycles) {
     let isHarmfulCycle = false;
 
-    // A cycle is harmful if AT LEAST ONE link in it uses imports on top-level
     for (let i = 0; i < cycle.length - 1; i++) {
       if (hasTopLevelUsage(cycle[i], cycle[i + 1])) {
         isHarmfulCycle = true;
@@ -464,7 +454,6 @@ function main() {
     }
   }
 
-  // Phase 3: Intelligently distribute critical cycles to their native entry points
   const entryPointCycles = new Map<string, string[][]>();
   for (const ep of entryPoints) {
     entryPointCycles.set(ep, []);
@@ -499,14 +488,22 @@ function main() {
 
     if (cycles.length > 0) {
       globalHasCycles = true;
-      console.error(`❌ [${absoluteEntry}] — Found ${cycles.length} critical circular dependencies:`);
+      console.error(`❌ ${absoluteEntry} — Found ${cycles.length} critical circular dependencies:`);
+      
       cycles.forEach((cycle, index) => {
-        const readableCycle = cycle.map((p) => path.resolve(p)).join('\n     -> ');
-        console.error(`  ${index + 1}) ${readableCycle}`);
+        console.error(`  ${index + 1})`, '-'.repeat(80));
+        
+        for (let i = 1; i < cycle.length; i++) {
+          const nextFile = (i === cycle.length - 1) ? cycle[1] : cycle[i + 1];
+          const isTopLevel = hasTopLevelUsage(cycle[i], nextFile);
+          
+          const prefix = isTopLevel ? '  💥 [Top-level] ' : '  ⏳ [Lazy]      ';
+          console.error(`${prefix}${path.resolve(cycle[i])}`);
+        }
       });
       console.error('');
     } else {
-      console.log(`✅ [${absoluteEntry}] — Clean!`);
+      console.log(`✅ ${absoluteEntry}`);
     }
   }
 

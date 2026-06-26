@@ -67,7 +67,7 @@ describe('Circular Dependency Detector CLI', () => {
       const result = runCLI('src/index.ts');
 
       expect(result.code).toBe(0);
-      expect(result.stdout).toContain('Clean!');
+      expect(result.stdout).toContain('✅');
       expect(result.stdout).toContain('All packages checked');
     });
 
@@ -91,7 +91,7 @@ describe('Circular Dependency Detector CLI', () => {
       const result = runCLI('src/index.ts');
 
       expect(result.code).toBe(0);
-      expect(result.stdout).toContain('Clean!');
+      expect(result.stdout).toContain('✅');
     });
   });
 
@@ -132,10 +132,8 @@ describe('Circular Dependency Detector CLI', () => {
       const result = runCLI('"packages/*/src"');
 
       expect(result.code).toBe(1);
-
-      expect(result.stdout).toContain('packages/core/src/index.ts] — Clean!');
-
-      expect(result.stderr).toContain('packages/rest/src/index.ts] — Found 1 critical circular dependencies:');
+      expect(result.stdout).toContain('✅');
+      expect(result.stderr).toContain('packages/rest/src/index.ts — Found 1 critical circular dependencies:');
       expect(result.stderr).toContain('packages/rest/src/internal.ts');
       expect(result.stderr).toContain('packages/rest/src/utils.ts');
     });
@@ -156,7 +154,7 @@ describe('Circular Dependency Detector CLI', () => {
       const result = runCLI('src/index.ts');
 
       expect(result.code).toBe(0);
-      expect(result.stdout).toContain('Clean!');
+      expect(result.stdout).toContain('✅');
     });
 
     it('should fail (Critical) if a cycle goes through a static class property', () => {
