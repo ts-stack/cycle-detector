@@ -11,8 +11,13 @@ const graph = new Map<string, string[]>();
 const allUniqueCycles: string[][] = [];
 const globalDetectedCycles = new Set<string>();
 
-const packageMetaCache = new Map<string, { pkgDir: string; srcDirName: string; outDirName: string; } | null>();
+const packageMetaCache = new Map<string, { pkgDir: string; srcDirName: string; outDirName: string } | null>();
 const compilerOptionsCache = new Map<string, ts.CompilerOptions>();
+
+// Caches for AST and analysis results to prevent bottlenecks
+const sourceFileCache = new Map<string, ts.SourceFile>();
+const topLevelUsageCache = new Map<string, boolean>();
+const exportedHoistedFunctionsCache = new Map<string, Set<string>>();
 
 let globalProjectPath: string | undefined;
 
@@ -40,12 +45,18 @@ function isRuntimeImport(node: ts.ImportDeclaration | ts.ExportDeclaration): boo
   }
 
   if (ts.isImportDeclaration(node)) {
-    if (!node.importClause) return true;
+    if (node.importClause?.phaseModifier) return false;
+    if (!node.importClause) return true; // Side-effect import
     if (node.importClause.phaseModifier) return false;
 
+    if (node.importClause.name) return true; // Default import present
+
     const namedBindings = node.importClause.namedBindings;
-    if (namedBindings && ts.isNamedImports(namedBindings)) {
-      return !namedBindings.elements.every((el) => el.isTypeOnly);
+    if (namedBindings) {
+      if (ts.isNamespaceImport(namedBindings)) return true;
+      if (ts.isNamedImports(namedBindings)) {
+        return !namedBindings.elements.every((el) => el.isTypeOnly);
+      }
     }
     return true;
   }
@@ -55,18 +66,14 @@ function isRuntimeImport(node: ts.ImportDeclaration | ts.ExportDeclaration): boo
 
 function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
   const currentDir = path.dirname(filePath);
-
   const cachedOptions = compilerOptionsCache.get(currentDir);
-  if (cachedOptions !== undefined) {
-    return cachedOptions;
-  }
+  if (cachedOptions !== undefined) return cachedOptions;
 
   const configPath = ts.findConfigFile(currentDir, ts.sys.fileExists, 'tsconfig.json') || globalProjectPath;
 
   if (configPath) {
     const resolvedConfigPath = path.resolve(configPath);
     const configDir = path.dirname(resolvedConfigPath);
-
     const cachedConfig = compilerOptionsCache.get(resolvedConfigPath);
     if (cachedConfig !== undefined) {
       compilerOptionsCache.set(currentDir, cachedConfig);
@@ -77,7 +84,6 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
       const configFile = ts.readConfigFile(resolvedConfigPath, ts.sys.readFile);
       const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, configDir);
       const options = parsedConfig.options || {};
-
       compilerOptionsCache.set(resolvedConfigPath, options);
       compilerOptionsCache.set(currentDir, options);
       return options;
@@ -108,13 +114,34 @@ function getPackageMeta(filePath: string) {
 
         let outDirName = 'dist';
         const mainField = pkg.main || pkg.types || pkg.typings || '';
-        if (mainField) {
-          const parts = path.normalize(mainField).split(path.sep);
-          if (parts.length > 1 && parts[0] !== '.' && parts[0] !== '..') {
-            outDirName = parts[0];
-          } else if (parts.length > 2 && (parts[0] === '.' || parts[0] === '..')) {
-            outDirName = parts[1];
+
+        let exportsMain = '';
+        if (pkg.exports) {
+          if (typeof pkg.exports === 'string') {
+            exportsMain = pkg.exports;
+          } else if (typeof pkg.exports === 'object') {
+            const dotExport = pkg.exports['.'];
+            if (dotExport) {
+              if (typeof dotExport === 'string') {
+                exportsMain = dotExport;
+              } else if (typeof dotExport === 'object') {
+                exportsMain = dotExport.import || dotExport.require || dotExport.default || '';
+              }
+            }
           }
+        }
+
+        const targetField = mainField || exportsMain;
+        if (targetField) {
+          const parts = path.normalize(targetField).split(path.sep);
+          const cleanParts = parts.filter((p) => p !== '.' && p !== '..');
+          if (cleanParts.length > 0) {
+            outDirName = cleanParts[0];
+          }
+        } else {
+          if (fs.existsSync(path.join(currentDir, 'dist'))) outDirName = 'dist';
+          else if (fs.existsSync(path.join(currentDir, 'build'))) outDirName = 'build';
+          else if (fs.existsSync(path.join(currentDir, 'out'))) outDirName = 'out';
         }
 
         let srcDirName = 'src';
@@ -144,19 +171,14 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
   if (!result.resolvedModule) return null;
 
   const resolvedFileName = path.resolve(result.resolvedModule.resolvedFileName);
-
-  if (resolvedFileName.includes(`${path.sep}node_modules${path.sep}`)) {
-    return null;
-  }
+  if (resolvedFileName.includes(`${path.sep}node_modules${path.sep}`)) return null;
 
   const meta = getPackageMeta(resolvedFileName);
   if (meta) {
     const { pkgDir, srcDirName, outDirName } = meta;
     const srcDirPath = path.join(pkgDir, srcDirName);
 
-    if (resolvedFileName.startsWith(srcDirPath + path.sep)) {
-      return resolvedFileName;
-    }
+    if (resolvedFileName.startsWith(srcDirPath + path.sep)) return resolvedFileName;
 
     const outDirPath = path.join(pkgDir, outDirName);
     if (resolvedFileName.startsWith(outDirPath + path.sep) || resolvedFileName === outDirPath) {
@@ -174,18 +196,12 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
       const extensions = ['.ts', '.tsx', '.mts', '.cts'];
       for (const ext of extensions) {
         const targetSrcFile = path.join(srcDirPath, baseName + ext);
-        if (fs.existsSync(targetSrcFile)) {
-          return targetSrcFile;
-        }
+        if (fs.existsSync(targetSrcFile)) return targetSrcFile;
       }
     }
   }
 
-  if (result.resolvedModule.isExternalLibraryImport) {
-    return null;
-  }
-
-  return resolvedFileName;
+  return result.resolvedModule.isExternalLibraryImport ? null : resolvedFileName;
 }
 
 function getCanonicalCycleKey(cycle: string[]): string {
@@ -194,9 +210,7 @@ function getCanonicalCycleKey(cycle: string[]): string {
 
   let minIdx = 0;
   for (let i = 1; i < nodes.length; i++) {
-    if (nodes[i] < nodes[minIdx]) {
-      minIdx = i;
-    }
+    if (nodes[i] < nodes[minIdx]) minIdx = i;
   }
 
   const rotated = [...nodes.slice(minIdx), ...nodes.slice(0, minIdx)];
@@ -209,8 +223,14 @@ function parseFile(filePath: string) {
   graph.set(filePath, []);
 
   const options = getCompilerOptionsForFile(filePath);
-  const content = fs.readFileSync(filePath, 'utf8');
-  const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+
+  let sourceFile = sourceFileCache.get(filePath);
+  if (!sourceFile) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+    sourceFileCache.set(filePath, sourceFile);
+  }
+
   const imports: string[] = [];
 
   function walk(node: ts.Node) {
@@ -233,16 +253,103 @@ function parseFile(filePath: string) {
 }
 
 /**
+ * Analyzes a file and extracts the names of all exported functions that are hoisted.
+ */
+function getExportedHoistedFunctions(filePath: string): Set<string> {
+  if (exportedHoistedFunctionsCache.has(filePath)) {
+    return exportedHoistedFunctionsCache.get(filePath)!;
+  }
+
+  const hoisted = new Set<string>();
+  if (!fs.existsSync(filePath)) {
+    exportedHoistedFunctionsCache.set(filePath, hoisted);
+    return hoisted;
+  }
+
+  let sourceFile = sourceFileCache.get(filePath);
+  if (!sourceFile) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+      sourceFileCache.set(filePath, sourceFile);
+    } catch {
+      exportedHoistedFunctionsCache.set(filePath, hoisted);
+      return hoisted;
+    }
+  }
+
+  const localHoistedFuncs = new Set<string>();
+
+  // Pass 1: Find all top-level function declarations and direct export modifiers
+  for (const statement of sourceFile.statements) {
+    if (ts.isFunctionDeclaration(statement)) {
+      if (statement.name) {
+        localHoistedFuncs.add(statement.name.text);
+      }
+      const hasExport = statement.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+      const hasDefault = statement.modifiers?.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+
+      if (hasExport) {
+        if (hasDefault) hoisted.add('default');
+        else if (statement.name) hoisted.add(statement.name.text);
+      }
+    }
+  }
+
+  // Pass 2: Look for independent export declarations or export assignments mapping to local functions
+  for (const statement of sourceFile.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      if (!statement.moduleSpecifier && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        for (const el of statement.exportClause.elements) {
+          const localName = el.propertyName ? el.propertyName.text : el.name.text;
+          const exportedName = el.name.text;
+          if (localHoistedFuncs.has(localName)) {
+            hoisted.add(exportedName);
+          }
+        }
+      }
+    } else if (ts.isExportAssignment(statement)) {
+      if (!statement.isExportEquals && ts.isIdentifier(statement.expression)) {
+        if (localHoistedFuncs.has(statement.expression.text)) {
+          hoisted.add('default');
+        }
+      }
+    }
+  }
+
+  exportedHoistedFunctionsCache.set(filePath, hoisted);
+  return hoisted;
+}
+
+/**
  * Checks if a specific file import creates an immediate execution (top-level) risk.
  */
 function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   if (!fs.existsSync(fromFile)) return false;
 
-  const options = getCompilerOptionsForFile(fromFile);
-  const content = fs.readFileSync(fromFile, 'utf8');
-  const sourceFile = ts.createSourceFile(fromFile, content, ts.ScriptTarget.Latest, true);
+  const cacheKey = `${fromFile}-->${toFile}`;
+  if (topLevelUsageCache.has(cacheKey)) return topLevelUsageCache.get(cacheKey)!;
 
-  const importedSymbols = new Set<string>();
+  const options = getCompilerOptionsForFile(fromFile);
+
+  let sourceFile = sourceFileCache.get(fromFile);
+  if (!sourceFile) {
+    try {
+      const content = fs.readFileSync(fromFile, 'utf8');
+      sourceFile = ts.createSourceFile(fromFile, content, ts.ScriptTarget.Latest, true);
+      sourceFileCache.set(fromFile, sourceFile);
+    } catch {
+      topLevelUsageCache.set(cacheKey, false);
+      return false;
+    }
+  }
+
+  // Get all safe hoisted exports from the target file
+  const hoistedExports = getExportedHoistedFunctions(toFile);
+
+  // Maps local import identifier to its original exported symbol name
+  const localToExportedName = new Map<string, string>();
+  let namespaceImportName: string | null = null;
   let hasSideEffectOrReExport = false;
 
   function findImports(node: ts.Node) {
@@ -254,13 +361,16 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
           if (resolved === toFile) {
             if (ts.isImportDeclaration(node) && node.importClause) {
               const clause = node.importClause;
-              if (clause.name) importedSymbols.add(clause.name.text);
+              if (clause.name) {
+                localToExportedName.set(clause.name.text, 'default');
+              }
               if (clause.namedBindings) {
                 if (ts.isNamespaceImport(clause.namedBindings)) {
-                  importedSymbols.add(clause.namedBindings.name.text);
+                  namespaceImportName = clause.namedBindings.name.text;
                 } else if (ts.isNamedImports(clause.namedBindings)) {
                   for (const el of clause.namedBindings.elements) {
-                    importedSymbols.add(el.name.text);
+                    const exportedName = el.propertyName ? el.propertyName.text : el.name.text;
+                    localToExportedName.set(el.name.text, exportedName);
                   }
                 }
               }
@@ -276,8 +386,14 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
 
   findImports(sourceFile);
 
-  if (hasSideEffectOrReExport) return true;
-  if (importedSymbols.size === 0) return false;
+  if (hasSideEffectOrReExport) {
+    topLevelUsageCache.set(cacheKey, true);
+    return true;
+  }
+  if (localToExportedName.size === 0 && !namespaceImportName) {
+    topLevelUsageCache.set(cacheKey, false);
+    return false;
+  }
 
   let dangerousTopLevelUsage = false;
 
@@ -299,41 +415,81 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
     }
 
     if (ts.isPropertyDeclaration(node)) {
-      const isStatic = node.modifiers?.some(m => m.kind === ts.SyntaxKind.StaticKeyword);
-      if (!isStatic) {
-        currentScopeLazy = true; 
-      }
+      const isStatic = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword);
+      if (!isStatic) currentScopeLazy = true;
     }
 
     if (!currentScopeLazy && ts.isIdentifier(node)) {
-      if (importedSymbols.has(node.text)) {
+      const isImportedSymbol = localToExportedName.has(node.text);
+      const isNamespaceReference = namespaceImportName && node.text === namespaceImportName;
+
+      if (isImportedSymbol || isNamespaceReference) {
         const parent = node.parent;
-        
-        const isImportDeclarationRef = 
-          ts.isImportSpecifier(parent) || 
-          ts.isImportClause(parent) || 
-          ts.isNamespaceImport(parent);
 
-        if (!isImportDeclarationRef) {
-          let isInTypeContext = false;
-          let checkParent: ts.Node | undefined = parent;
-          while (checkParent && checkParent !== sourceFile) {
-            if (
-              ts.isTypeNode(checkParent) || 
-              ts.isTypeReferenceNode(checkParent) || 
-              ts.isTypeAliasDeclaration(checkParent) || 
-              ts.isInterfaceDeclaration(checkParent)
-            ) {
-              isInTypeContext = true;
-              break;
+        // Protection 1: Skip metadata/declarations references
+        const isImportOrExportDeclarationRef =
+          ts.isImportSpecifier(parent) ||
+          ts.isImportClause(parent) ||
+          ts.isNamespaceImport(parent) ||
+          ts.isExportSpecifier(parent);
+
+        if (isImportOrExportDeclarationRef) return;
+
+        // Protection 2: Avoid object property name access False Positives (obj.foo)
+        if (ts.isPropertyAccessExpression(parent) && parent.name === node) return;
+
+        // Protection 3: Avoid object assignment keys False Positives ({ foo: 123 })
+        if (ts.isPropertyAssignment(parent) && parent.name === node) return;
+
+        // Protection 4: Avoid shadow declarations with matching names
+        if (
+          (ts.isMethodDeclaration(parent) ||
+            ts.isPropertyDeclaration(parent) ||
+            ts.isClassDeclaration(parent) ||
+            ts.isInterfaceDeclaration(parent) ||
+            ts.isFunctionDeclaration(parent)) &&
+          parent.name === node
+        ) {
+          return;
+        }
+
+        // (Hoisting check 1): Direct or renamed named/default import usage
+        if (isImportedSymbol) {
+          const exportedName = localToExportedName.get(node.text)!;
+          if (hoistedExports.has(exportedName)) {
+            return; // Perfectly safe hoisted function call/reference!
+          }
+        }
+
+        // (Hoisting check 2): Namespace import property access usage (ns.foo())
+        if (isNamespaceReference) {
+          if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
+            const propName = parent.name.text;
+            if (hoistedExports.has(propName)) {
+              return; // Perfectly safe property from namespace!
             }
-            checkParent = checkParent.parent;
           }
+        }
 
-          if (!isInTypeContext) {
-            dangerousTopLevelUsage = true;
-            return;
+        // Protection 5: Type contexts checks
+        let isInTypeContext = false;
+        let checkParent: ts.Node | undefined = parent;
+        while (checkParent && checkParent !== sourceFile) {
+          if (
+            ts.isTypeNode(checkParent) ||
+            ts.isTypeReferenceNode(checkParent) ||
+            ts.isTypeAliasDeclaration(checkParent) ||
+            ts.isInterfaceDeclaration(checkParent)
+          ) {
+            isInTypeContext = true;
+            break;
           }
+          checkParent = checkParent.parent;
+        }
+
+        if (!isInTypeContext) {
+          dangerousTopLevelUsage = true;
+          return;
         }
       }
     }
@@ -342,6 +498,7 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   }
 
   checkNodeUsage(sourceFile, false);
+  topLevelUsageCache.set(cacheKey, dangerousTopLevelUsage);
   return dangerousTopLevelUsage;
 }
 
@@ -356,9 +513,7 @@ function canReach(start: string, target: string): boolean {
     seen.add(current);
 
     const deps = graph.get(current) || [];
-    for (const dep of deps) {
-      stack.push(dep);
-    }
+    for (const dep of deps) stack.push(dep);
   }
   return false;
 }
@@ -432,36 +587,27 @@ function main() {
   }
 
   for (const entryPoint of entryPoints) {
-    if (!visited.has(entryPoint)) {
-      findCycles(entryPoint);
-    }
+    if (!visited.has(entryPoint)) findCycles(entryPoint);
   }
 
   const criticalCycles: string[][] = [];
 
   for (const cycle of allUniqueCycles) {
     let isHarmfulCycle = false;
-
     for (let i = 0; i < cycle.length - 1; i++) {
       if (hasTopLevelUsage(cycle[i], cycle[i + 1])) {
         isHarmfulCycle = true;
         break;
       }
     }
-
-    if (isHarmfulCycle) {
-      criticalCycles.push(cycle);
-    }
+    if (isHarmfulCycle) criticalCycles.push(cycle);
   }
 
   const entryPointCycles = new Map<string, string[][]>();
-  for (const ep of entryPoints) {
-    entryPointCycles.set(ep, []);
-  }
+  for (const ep of entryPoints) entryPointCycles.set(ep, []);
 
   for (const cycle of criticalCycles) {
     const firstFile = cycle[0];
-
     const matchedEp = entryPoints.find((ep) => {
       const epDir = path.dirname(ep);
       return firstFile.startsWith(epDir + path.sep) || firstFile === ep;
@@ -471,15 +617,11 @@ function main() {
       entryPointCycles.get(matchedEp)!.push(cycle);
     } else {
       const reachingEp = entryPoints.find((ep) => canReach(ep, firstFile));
-      if (reachingEp) {
-        entryPointCycles.get(reachingEp)!.push(cycle);
-      } else {
-        entryPointCycles.get(entryPoints[0])!.push(cycle);
-      }
+      if (reachingEp) entryPointCycles.get(reachingEp)!.push(cycle);
+      else entryPointCycles.get(entryPoints[0])!.push(cycle);
     }
   }
 
-  // Phase 4: Output the clean, perfectly targeted report
   let globalHasCycles = false;
 
   for (const entryPoint of entryPoints) {
@@ -489,14 +631,12 @@ function main() {
     if (cycles.length > 0) {
       globalHasCycles = true;
       console.error(`❌ ${absoluteEntry} — Found ${cycles.length} critical circular dependencies:`);
-      
+
       cycles.forEach((cycle, index) => {
         console.error(`  ${index + 1})`, '-'.repeat(80));
-        
         for (let i = 1; i < cycle.length; i++) {
-          const nextFile = (i === cycle.length - 1) ? cycle[1] : cycle[i + 1];
+          const nextFile = i === cycle.length - 1 ? cycle[1] : cycle[i + 1];
           const isTopLevel = hasTopLevelUsage(cycle[i], nextFile);
-          
           const prefix = isTopLevel ? '  💥 [Top-level] ' : '  ⏳ [Lazy]      ';
           console.error(`${prefix}${path.resolve(cycle[i])}`);
         }

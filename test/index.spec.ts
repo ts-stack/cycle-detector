@@ -114,7 +114,10 @@ describe('Circular Dependency Detector CLI', () => {
         path.join(TMP_DIR, 'packages/core/package.json'),
         JSON.stringify({ name: '@monorepo/core', main: 'src/index.ts' }),
       );
-      createFixture(path.join(TMP_DIR, 'packages/core/src/index.ts'), "import { restInit } from '@monorepo/rest';");
+      createFixture(
+        path.join(TMP_DIR, 'packages/core/src/index.ts'), 
+        "import { restInit } from '@monorepo/rest'; export const coreAsset = 1;"
+      );
 
       createFixture(
         path.join(TMP_DIR, 'packages/rest/package.json'),
@@ -143,12 +146,12 @@ describe('Circular Dependency Detector CLI', () => {
     it('should pass (Clean) if a cycle goes through a non-static class property', () => {
       createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
 
-      // index.ts -> b.ts (лінивий виклик через функцію)
+      // index.ts -> b.ts
       createFixture(
         path.join(TMP_DIR, 'src/index.ts'),
-        "import { B } from './b'; export function getB() { return B; }",
+        "import { B } from './b'; export function getB() { return B; } export const A = 1;",
       );
-      // b.ts -> index.ts (лінивий виклик через звичайну властивість інстансу класу)
+      // b.ts -> index.ts
       createFixture(path.join(TMP_DIR, 'src/b.ts'), "import { A } from './index'; export class B { prop = A; }");
 
       const result = runCLI('src/index.ts');
@@ -160,12 +163,12 @@ describe('Circular Dependency Detector CLI', () => {
     it('should fail (Critical) if a cycle goes through a static class property', () => {
       createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
 
-      // index.ts -> b.ts (лінивий виклик через функцію)
+      // index.ts -> b.ts
       createFixture(
         path.join(TMP_DIR, 'src/index.ts'),
-        "import { B } from './b'; export function getB() { return B; }",
+        "import { B } from './b'; export function getB() { return B; } export const A = 1;",
       );
-      // b.ts -> index.ts (КРИТИЧНИЙ виклик, бо static виконується top-level в момент імпорту)
+      // b.ts -> index.ts
       createFixture(path.join(TMP_DIR, 'src/b.ts'), "import { A } from './index'; export class B { static prop = A; }");
 
       const result = runCLI('src/index.ts');
@@ -173,6 +176,88 @@ describe('Circular Dependency Detector CLI', () => {
       expect(result.code).toBe(1);
       expect(result.stderr).toContain('Critical circular dependencies detected');
       expect(result.stderr).toContain('Validation failed');
+    });
+  });
+
+  describe('Hoisted Functions Evaluation (Safe vs Critical)', () => {
+    it('should pass (Clean) if top-level uses a hoisted function declaration', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import { getMessage } from './b'; const msg = getMessage(); export const indexAsset = 1;",
+      );
+      // b.ts -> index.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/b.ts'),
+        "import { indexAsset } from './index'; export function getMessage() { return 'hello'; }",
+      );
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should fail (Critical) if top-level uses a function expression assigned to const (TDZ)', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import { getMessage } from './b'; const msg = getMessage(); export const indexAsset = 1;",
+      );
+      // b.ts -> index.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/b.ts'),
+        "import { indexAsset } from './index'; export const getMessage = () => 'hello';",
+      );
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Critical circular dependencies detected');
+    });
+
+    it('should pass (Clean) if top-level uses a hoisted function via namespace import (ns.foo())', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import * as b from './b'; const msg = b.getMessage(); export const indexAsset = 1;",
+      );
+      // b.ts -> index.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/b.ts'),
+        "import { indexAsset } from './index'; export function getMessage() { return 'hello'; }",
+      );
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should pass (Clean) if top-level uses a hoisted function that was renamed during import (as)', () => {
+      createFixture(path.join(TMP_DIR, 'tsconfig.json'), '{}');
+
+      // index.ts -> b.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/index.ts'),
+        "import { getMessage as fn } from './b'; const msg = fn(); export const indexAsset = 1;",
+      );
+      // b.ts -> index.ts
+      createFixture(
+        path.join(TMP_DIR, 'src/b.ts'),
+        "import { indexAsset } from './index'; export function getMessage() { return 'hello'; }",
+      );
+
+      const result = runCLI('src/index.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
     });
   });
 });
