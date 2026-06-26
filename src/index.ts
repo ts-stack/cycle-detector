@@ -11,31 +11,21 @@ const graph = new Map<string, string[]>();
 const allUniqueCycles: string[][] = [];
 const globalDetectedCycles = new Set<string>();
 
-const packageMetaCache = new Map<string, { pkgDir: string; srcDirName: string; outDirName: string } | null>();
 const compilerOptionsCache = new Map<string, ts.CompilerOptions>();
-
-// Caches for AST and analysis results to prevent bottlenecks
 const sourceFileCache = new Map<string, ts.SourceFile>();
 const topLevelUsageCache = new Map<string, boolean>();
 const exportedHoistedFunctionsCache = new Map<string, Set<string>>();
-
-let globalProjectPath: string | undefined;
+const resolvedSourceCache = new Map<string, string>(); // Performance cache for path mapping
 
 function parseArgs() {
   const args = [...process.argv.slice(2)];
-  let projectPath: string | undefined;
   const entryPatterns: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--project' || args[i] === '-p') {
-      projectPath = args[i + 1];
-      i++;
-    } else {
-      entryPatterns.push(args[i]);
-    }
+    entryPatterns.push(args[i]);
   }
 
-  return { entryPatterns, projectPath };
+  return { entryPatterns };
 }
 
 function isRuntimeImport(node: ts.ImportDeclaration | ts.ExportDeclaration): boolean {
@@ -47,7 +37,6 @@ function isRuntimeImport(node: ts.ImportDeclaration | ts.ExportDeclaration): boo
   if (ts.isImportDeclaration(node)) {
     if (node.importClause?.phaseModifier) return false;
     if (!node.importClause) return true; // Side-effect import
-    if (node.importClause.phaseModifier) return false;
 
     if (node.importClause.name) return true; // Default import present
 
@@ -69,7 +58,7 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
   const cachedOptions = compilerOptionsCache.get(currentDir);
   if (cachedOptions !== undefined) return cachedOptions;
 
-  const configPath = ts.findConfigFile(currentDir, ts.sys.fileExists, 'tsconfig.json') || globalProjectPath;
+  const configPath = ts.findConfigFile(currentDir, ts.sys.fileExists, 'tsconfig.json');
 
   if (configPath) {
     const resolvedConfigPath = path.resolve(configPath);
@@ -95,75 +84,78 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
   return {};
 }
 
-function getPackageMeta(filePath: string) {
-  let currentDir = path.dirname(filePath);
-  const visitedDirs: string[] = [];
+/**
+ * Universal resolution engine: safely maps compiled assets (.js, .d.ts) back to source files (.ts)
+ * Works flawlessly for standalone packages, polyrepos, and complex monorepos alike.
+ */
+function convertToSourcePath(resolvedPath: string): string {
+  // If it's already a source file and not trapped inside a known build directory, return it directly
+  if (/\.(ts|tsx|mts|cts)$/.test(resolvedPath) && !/[\\/](dist|build|lib|out|cjs|esm|bin)[\\/]/i.test(resolvedPath)) {
+    return resolvedPath;
+  }
 
-  while (currentDir && currentDir !== path.parse(currentDir).root) {
-    const cached = packageMetaCache.get(currentDir);
-    if (cached !== undefined) {
-      for (const d of visitedDirs) packageMetaCache.set(d, cached);
-      return cached;
+  const extensions = ['.ts', '.tsx', '.mts', '.cts'];
+
+  // Strip execution/declaration extensions to get the base file signature
+  let baseName = resolvedPath;
+  if (baseName.endsWith('.d.ts')) baseName = baseName.slice(0, -5);
+  else if (baseName.endsWith('.d.mts')) baseName = baseName.slice(0, -6);
+  else if (baseName.endsWith('.d.cts')) baseName = baseName.slice(0, -6);
+  else if (baseName.endsWith('.js')) baseName = baseName.slice(0, -3);
+  else if (baseName.endsWith('.mjs')) baseName = baseName.slice(0, -4);
+  else if (baseName.endsWith('.cjs')) baseName = baseName.slice(0, -4);
+  else if (baseName.endsWith('.jsx')) baseName = baseName.slice(0, -4);
+
+  // Strategy 1: Direct Extension Swap (In-place builds or matching structures)
+  for (const ext of extensions) {
+    if (fs.existsSync(baseName + ext)) return baseName + ext;
+  }
+
+  // Strategy 2: Adaptive Path Segment Replacement (Remaps build directories to source directories)
+  const buildDirs = ['dist', 'build', 'lib', 'out', 'cjs', 'esm', 'bin'];
+  const srcDirs = ['src', 'source', '.']; // '.' fallback for flat root architectures
+
+  for (const bDir of buildDirs) {
+    const regex = new RegExp(`([\\\\/])${bDir}([\\\\/])`, 'i');
+    if (regex.test(baseName)) {
+      for (const sDir of srcDirs) {
+        // Skip illegal mappings that loop 'lib' back onto 'lib'
+        if (bDir.toLowerCase() === sDir.toLowerCase()) continue;
+
+        const replacedBase = baseName.replace(regex, `$1${sDir}$2`);
+        for (const ext of extensions) {
+          if (fs.existsSync(replacedBase + ext)) return replacedBase + ext;
+        }
+      }
     }
+  }
 
-    const pkgJsonPath = path.join(currentDir, 'package.json');
-    if (fs.existsSync(pkgJsonPath)) {
-      try {
-        const content = fs.readFileSync(pkgJsonPath, 'utf8');
-        const pkg = JSON.parse(content);
+  // Strategy 3: Boundary-driven subpath mapping via closest package.json
+  let currentDir = path.dirname(resolvedPath);
+  while (currentDir && currentDir !== path.parse(currentDir).root) {
+    if (fs.existsSync(path.join(currentDir, 'package.json'))) {
+      for (const sDir of ['src', 'source']) {
+        const srcDirPath = path.join(currentDir, sDir);
+        if (fs.existsSync(srcDirPath)) {
+          const relativeToPackage = path.relative(currentDir, baseName);
+          const pathParts = relativeToPackage.split(path.sep);
 
-        let outDirName = 'dist';
-        const mainField = pkg.main || pkg.types || pkg.typings || '';
-
-        let exportsMain = '';
-        if (pkg.exports) {
-          if (typeof pkg.exports === 'string') {
-            exportsMain = pkg.exports;
-          } else if (typeof pkg.exports === 'object') {
-            const dotExport = pkg.exports['.'];
-            if (dotExport) {
-              if (typeof dotExport === 'string') {
-                exportsMain = dotExport;
-              } else if (typeof dotExport === 'object') {
-                exportsMain = dotExport.import || dotExport.require || dotExport.default || '';
-              }
+          if (pathParts.length > 1) {
+            // Drop the first segment (which is the output folder like 'dist' or 'lib')
+            const subPath = pathParts.slice(1).join(path.sep);
+            for (const ext of extensions) {
+              const targetFile = path.join(srcDirPath, subPath + ext);
+              if (fs.existsSync(targetFile)) return targetFile;
             }
           }
         }
-
-        const targetField = mainField || exportsMain;
-        if (targetField) {
-          const parts = path.normalize(targetField).split(path.sep);
-          const cleanParts = parts.filter((p) => p !== '.' && p !== '..');
-          if (cleanParts.length > 0) {
-            outDirName = cleanParts[0];
-          }
-        } else {
-          if (fs.existsSync(path.join(currentDir, 'dist'))) outDirName = 'dist';
-          else if (fs.existsSync(path.join(currentDir, 'build'))) outDirName = 'build';
-          else if (fs.existsSync(path.join(currentDir, 'out'))) outDirName = 'out';
-        }
-
-        let srcDirName = 'src';
-        if (fs.existsSync(path.join(currentDir, 'source'))) srcDirName = 'source';
-        else if (fs.existsSync(path.join(currentDir, 'lib'))) srcDirName = 'lib';
-
-        const meta = { pkgDir: currentDir, srcDirName, outDirName };
-        packageMetaCache.set(currentDir, meta);
-        for (const d of visitedDirs) packageMetaCache.set(d, meta);
-        return meta;
-      } catch {
-        packageMetaCache.set(currentDir, null);
-        for (const d of visitedDirs) packageMetaCache.set(d, null);
-        return null;
       }
+      break;
     }
-
-    visitedDirs.push(currentDir);
     currentDir = path.dirname(currentDir);
   }
 
-  return null;
+  return resolvedPath;
 }
 
 function resolveModule(moduleName: string, containingFile: string, options: ts.CompilerOptions): string | null {
@@ -171,37 +163,21 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
   if (!result.resolvedModule) return null;
 
   const resolvedFileName = path.resolve(result.resolvedModule.resolvedFileName);
-  if (resolvedFileName.includes(`${path.sep}node_modules${path.sep}`)) return null;
 
-  const meta = getPackageMeta(resolvedFileName);
-  if (meta) {
-    const { pkgDir, srcDirName, outDirName } = meta;
-    const srcDirPath = path.join(pkgDir, srcDirName);
-
-    if (resolvedFileName.startsWith(srcDirPath + path.sep)) return resolvedFileName;
-
-    const outDirPath = path.join(pkgDir, outDirName);
-    if (resolvedFileName.startsWith(outDirPath + path.sep) || resolvedFileName === outDirPath) {
-      const relativeToOut = path.relative(outDirPath, resolvedFileName);
-      let baseName = relativeToOut;
-
-      if (baseName.endsWith('.d.ts')) baseName = baseName.slice(0, -5);
-      else if (baseName.endsWith('.d.mts')) baseName = baseName.slice(0, -6);
-      else if (baseName.endsWith('.d.cts')) baseName = baseName.slice(0, -6);
-      else if (baseName.endsWith('.js')) baseName = baseName.slice(0, -3);
-      else if (baseName.endsWith('.mjs')) baseName = baseName.slice(0, -4);
-      else if (baseName.endsWith('.cjs')) baseName = baseName.slice(0, -4);
-      else if (baseName.endsWith('.jsx')) baseName = baseName.slice(0, -4);
-
-      const extensions = ['.ts', '.tsx', '.mts', '.cts'];
-      for (const ext of extensions) {
-        const targetSrcFile = path.join(srcDirPath, baseName + ext);
-        if (fs.existsSync(targetSrcFile)) return targetSrcFile;
-      }
-    }
+  // Run universal mapping first
+  let sourcePath = resolvedSourceCache.get(resolvedFileName);
+  if (!sourcePath) {
+    sourcePath = convertToSourcePath(resolvedFileName);
+    resolvedSourceCache.set(resolvedFileName, sourcePath);
   }
 
-  return result.resolvedModule.isExternalLibraryImport ? null : resolvedFileName;
+  // Safety filter: Ignore true external node_modules.
+  // Symlinked monorepo packages will successfully map to their local paths above and bypass this check.
+  if (sourcePath.includes(`${path.sep}node_modules${path.sep}`)) {
+    return null;
+  }
+
+  return result.resolvedModule.isExternalLibraryImport ? null : sourcePath;
 }
 
 function getCanonicalCycleKey(cycle: string[]): string {
@@ -252,9 +228,6 @@ function parseFile(filePath: string) {
   for (const dep of imports) parseFile(dep);
 }
 
-/**
- * Analyzes a file and extracts the names of all exported functions that are hoisted.
- */
 function getExportedHoistedFunctions(filePath: string): Set<string> {
   if (exportedHoistedFunctionsCache.has(filePath)) {
     return exportedHoistedFunctionsCache.get(filePath)!;
@@ -280,7 +253,6 @@ function getExportedHoistedFunctions(filePath: string): Set<string> {
 
   const localHoistedFuncs = new Set<string>();
 
-  // Pass 1: Find all top-level function declarations and direct export modifiers
   for (const statement of sourceFile.statements) {
     if (ts.isFunctionDeclaration(statement)) {
       if (statement.name) {
@@ -296,7 +268,6 @@ function getExportedHoistedFunctions(filePath: string): Set<string> {
     }
   }
 
-  // Pass 2: Look for independent export declarations or export assignments mapping to local functions
   for (const statement of sourceFile.statements) {
     if (ts.isExportDeclaration(statement)) {
       if (!statement.moduleSpecifier && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
@@ -321,9 +292,6 @@ function getExportedHoistedFunctions(filePath: string): Set<string> {
   return hoisted;
 }
 
-/**
- * Checks if a specific file import creates an immediate execution (top-level) risk.
- */
 function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   if (!fs.existsSync(fromFile)) return false;
 
@@ -344,10 +312,7 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
     }
   }
 
-  // Get all safe hoisted exports from the target file
   const hoistedExports = getExportedHoistedFunctions(toFile);
-
-  // Maps local import identifier to its original exported symbol name
   const localToExportedName = new Map<string, string>();
   let namespaceImportName: string | null = null;
   let hasSideEffectOrReExport = false;
@@ -369,6 +334,8 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
                   namespaceImportName = clause.namedBindings.name.text;
                 } else if (ts.isNamedImports(clause.namedBindings)) {
                   for (const el of clause.namedBindings.elements) {
+                    if (el.isTypeOnly) continue;
+
                     const exportedName = el.propertyName ? el.propertyName.text : el.name.text;
                     localToExportedName.set(el.name.text, exportedName);
                   }
@@ -426,7 +393,6 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
       if (isImportedSymbol || isNamespaceReference) {
         const parent = node.parent;
 
-        // Protection 1: Skip metadata/declarations references
         const isImportOrExportDeclarationRef =
           ts.isImportSpecifier(parent) ||
           ts.isImportClause(parent) ||
@@ -434,14 +400,8 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
           ts.isExportSpecifier(parent);
 
         if (isImportOrExportDeclarationRef) return;
-
-        // Protection 2: Avoid object property name access False Positives (obj.foo)
         if (ts.isPropertyAccessExpression(parent) && parent.name === node) return;
-
-        // Protection 3: Avoid object assignment keys False Positives ({ foo: 123 })
         if (ts.isPropertyAssignment(parent) && parent.name === node) return;
-
-        // Protection 4: Avoid shadow declarations with matching names
         if (
           (ts.isMethodDeclaration(parent) ||
             ts.isPropertyDeclaration(parent) ||
@@ -453,25 +413,18 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
           return;
         }
 
-        // (Hoisting check 1): Direct or renamed named/default import usage
         if (isImportedSymbol) {
           const exportedName = localToExportedName.get(node.text)!;
-          if (hoistedExports.has(exportedName)) {
-            return; // Perfectly safe hoisted function call/reference!
-          }
+          if (hoistedExports.has(exportedName)) return;
         }
 
-        // (Hoisting check 2): Namespace import property access usage (ns.foo())
         if (isNamespaceReference) {
           if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
             const propName = parent.name.text;
-            if (hoistedExports.has(propName)) {
-              return; // Perfectly safe property from namespace!
-            }
+            if (hoistedExports.has(propName)) return;
           }
         }
 
-        // Protection 5: Type contexts checks
         let isInTypeContext = false;
         let checkParent: ts.Node | undefined = parent;
         while (checkParent && checkParent !== sourceFile) {
@@ -519,8 +472,7 @@ function canReach(start: string, target: string): boolean {
 }
 
 function main() {
-  const { entryPatterns, projectPath } = parseArgs();
-  globalProjectPath = projectPath;
+  const { entryPatterns } = parseArgs();
 
   if (entryPatterns.length === 0) {
     console.error('❌ Error: Please specify at least one entry point or glob pattern.');

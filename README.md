@@ -33,11 +33,6 @@ And then:
 npm run lint:cycles
 ```
 
-### Arguments & Flags
-
-* `<entry-patterns>`: Glob patterns or paths to entry point files (e.g., `packages/*/src/index.ts`).
-* `-p, --project <path>`: Path to your root or fallback `tsconfig.json`.
-
 ## Interpreting Diagnostics
 
 When a breaking circular dependency is detected, the script identifies exactly **which file executes the token prematurely**, leaving non-blocking files clearly marked.
