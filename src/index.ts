@@ -6,11 +6,7 @@ import ts from 'typescript';
 
 type NodeState = 'VISITING' | 'VISITED';
 
-// Global shared structures for maximum performance
-const graph = new Map<string, string[]>();
-const allUniqueCycles: string[][] = [];
-const globalDetectedCycles = new Set<string>();
-
+// Performance caches that are safe to share across calls (read-only filesystem data)
 const compilerOptionsCache = new Map<string, ts.CompilerOptions>();
 const sourceFileCache = new Map<string, ts.SourceFile>();
 const topLevelUsageCache = new Map<string, boolean>();
@@ -18,14 +14,7 @@ const exportedHoistedFunctionsCache = new Map<string, Set<string>>();
 const resolvedSourceCache = new Map<string, string>(); // Performance cache for path mapping
 
 function parseArgs() {
-  const args = [...process.argv.slice(2)];
-  const entryPatterns: string[] = [];
-
-  for (let i = 0; i < args.length; i++) {
-    entryPatterns.push(args[i]);
-  }
-
-  return { entryPatterns };
+  return { entryPatterns: process.argv.slice(2) };
 }
 
 function isRuntimeImport(node: ts.ImportDeclaration | ts.ExportDeclaration): boolean {
@@ -81,7 +70,9 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
     }
   }
 
-  return {};
+  const emptyOptions = {};
+  compilerOptionsCache.set(currentDir, emptyOptions);
+  return emptyOptions;
 }
 
 /**
@@ -89,8 +80,10 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
  * Works flawlessly for standalone packages, polyrepos, and complex monorepos alike.
  */
 function convertToSourcePath(resolvedPath: string): string {
+  const isBuildDir = new RegExp(String.raw`[\\/](dist|build|lib|out|cjs|esm|bin)[\\/]`, 'i');
+
   // If it's already a source file and not trapped inside a known build directory, return it directly
-  if (/\.(ts|tsx|mts|cts)$/.test(resolvedPath) && !/[\\/](dist|build|lib|out|cjs|esm|bin)[\\/]/i.test(resolvedPath)) {
+  if (/\.(ts|tsx|mts|cts)$/.test(resolvedPath) && !isBuildDir.test(resolvedPath)) {
     return resolvedPath;
   }
 
@@ -116,7 +109,7 @@ function convertToSourcePath(resolvedPath: string): string {
   const srcDirs = ['src', 'source', '.']; // '.' fallback for flat root architectures
 
   for (const bDir of buildDirs) {
-    const regex = new RegExp(`([\\\\/])${bDir}([\\\\/])`, 'i');
+    const regex = new RegExp(String.raw`([\\/])${bDir}([\\/])`, 'i');
     if (regex.test(baseName)) {
       for (const sDir of srcDirs) {
         // Skip illegal mappings that loop 'lib' back onto 'lib'
@@ -164,9 +157,9 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
 
   const resolvedFileName = path.resolve(result.resolvedModule.resolvedFileName);
 
-  // Run universal mapping first
+  // Run universal mapping first: dist/*.d.ts -> src/*.ts
   let sourcePath = resolvedSourceCache.get(resolvedFileName);
-  if (!sourcePath) {
+  if (sourcePath === undefined) {
     sourcePath = convertToSourcePath(resolvedFileName);
     resolvedSourceCache.set(resolvedFileName, sourcePath);
   }
@@ -177,7 +170,7 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
     return null;
   }
 
-  return result.resolvedModule.isExternalLibraryImport ? null : sourcePath;
+  return sourcePath;
 }
 
 function getCanonicalCycleKey(cycle: string[]): string {
@@ -194,38 +187,48 @@ function getCanonicalCycleKey(cycle: string[]): string {
   return rotated.join('|');
 }
 
-function parseFile(filePath: string) {
-  if (graph.has(filePath) || !fs.existsSync(filePath)) return;
-  graph.set(filePath, []);
+function parseFile(startPath: string, graph: Map<string, string[]>) {
+  // Iterative DFS to avoid stack overflow on deeply nested dependency trees
+  const queue = [startPath];
 
-  const options = getCompilerOptionsForFile(filePath);
+  while (queue.length > 0) {
+    const filePath = queue.pop()!;
 
-  let sourceFile = sourceFileCache.get(filePath);
-  if (!sourceFile) {
-    const content = fs.readFileSync(filePath, 'utf8');
-    sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
-    sourceFileCache.set(filePath, sourceFile);
-  }
+    if (graph.has(filePath) || !fs.existsSync(filePath)) continue;
+    graph.set(filePath, []);
 
-  const imports: string[] = [];
+    const options = getCompilerOptionsForFile(filePath);
 
-  function walk(node: ts.Node) {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      if (isRuntimeImport(node)) {
-        const specifier = node.moduleSpecifier;
-        if (specifier && ts.isStringLiteral(specifier)) {
-          const resolved = resolveModule(specifier.text, filePath, options);
-          if (resolved && !imports.includes(resolved)) imports.push(resolved);
+    let sourceFile = sourceFileCache.get(filePath);
+    if (!sourceFile) {
+      const content = fs.readFileSync(filePath, 'utf8');
+      sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+      sourceFileCache.set(filePath, sourceFile);
+    }
+
+    const imports: string[] = [];
+
+    function walk(node: ts.Node) {
+      if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+        if (isRuntimeImport(node)) {
+          const specifier = node.moduleSpecifier;
+          if (specifier && ts.isStringLiteral(specifier)) {
+            const resolved = resolveModule(specifier.text, filePath, options);
+            if (resolved && !imports.includes(resolved)) imports.push(resolved);
+          }
         }
       }
+      ts.forEachChild(node, walk);
     }
-    ts.forEachChild(node, walk);
+
+    walk(sourceFile);
+    graph.set(filePath, imports);
+
+    // Push unvisited dependencies onto the queue
+    for (const dep of imports) {
+      if (!graph.has(dep)) queue.push(dep);
+    }
   }
-
-  walk(sourceFile);
-  graph.set(filePath, imports);
-
-  for (const dep of imports) parseFile(dep);
 }
 
 function getExportedHoistedFunctions(filePath: string): Set<string> {
@@ -342,6 +345,7 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
                 }
               }
             } else {
+              // Side-effect import OR export ... from '...' (re-export) — always top-level
               hasSideEffectOrReExport = true;
             }
           }
@@ -455,7 +459,7 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   return dangerousTopLevelUsage;
 }
 
-function canReach(start: string, target: string): boolean {
+function canReach(start: string, target: string, graph: Map<string, string[]>): boolean {
   const seen = new Set<string>();
   const stack = [start];
 
@@ -478,6 +482,11 @@ function main() {
     console.error('❌ Error: Please specify at least one entry point or glob pattern.');
     process.exit(1);
   }
+
+  // All mutable state is local to each run — no cross-run contamination
+  const graph = new Map<string, string[]>();
+  const allUniqueCycles: string[][] = [];
+  const globalDetectedCycles = new Set<string>();
 
   const entryPoints: string[] = [];
 
@@ -507,7 +516,7 @@ function main() {
   console.log(`🔍 Found ${entryPoints.length} entry point(s) for analysis. Building graph...\n`);
 
   for (const entryPoint of entryPoints) {
-    parseFile(entryPoint);
+    parseFile(entryPoint, graph);
   }
 
   const visited = new Map<string, NodeState>();
@@ -568,7 +577,7 @@ function main() {
     if (matchedEp) {
       entryPointCycles.get(matchedEp)!.push(cycle);
     } else {
-      const reachingEp = entryPoints.find((ep) => canReach(ep, firstFile));
+      const reachingEp = entryPoints.find((ep) => canReach(ep, firstFile, graph));
       if (reachingEp) entryPointCycles.get(reachingEp)!.push(cycle);
       else entryPointCycles.get(entryPoints[0])!.push(cycle);
     }

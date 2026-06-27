@@ -293,6 +293,187 @@ describe('Circular Dependency Detector CLI — Comprehensive Suite', () => {
     });
   });
 
+  describe('5. Re-export Variants', () => {
+    beforeEach(() => {
+      createFixture('tsconfig.json', '{}');
+    });
+
+    it('should fail (Critical) on export * from "./b" (re-export all) when cycle exists', () => {
+      // index.ts re-exports everything from b.ts, b.ts imports from index.ts
+      createFixture('src/index.ts', "export * from './b'; export const A = 1;");
+      createFixture('src/b.ts', "import { A } from './index'; export const bAsset = 42;");
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Critical circular dependencies detected');
+    });
+
+    it('should pass (Clean) when the re-export source has no cycle back', () => {
+      // index.ts re-exports from b.ts, but b.ts does NOT import from index.ts
+      createFixture('src/index.ts', "export * from './b';");
+      createFixture('src/b.ts', 'export const bAsset = 42;');
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+  });
+
+  describe('6. Multi-node Cycles (3+ nodes)', () => {
+    beforeEach(() => {
+      createFixture('tsconfig.json', '{}');
+    });
+
+    it('should pass (Clean) on a 3-node cycle A→B→C→A where ALL usages are lazy (inside functions)', () => {
+      // A → B: lazy usage inside a function
+      createFixture(
+        'src/a.ts',
+        `import { b } from './b';
+         export function useB() { return b(); }
+         export const A = 1;`,
+      );
+      // B → C: lazy usage inside a function
+      createFixture(
+        'src/b.ts',
+        `import { c } from './c';
+         export function b() { return c(); }
+         export const B = 2;`,
+      );
+      // C → A: lazy usage inside a function (closes the cycle)
+      createFixture(
+        'src/c.ts',
+        `import { A } from './a';
+         export function c() { return A; }
+         export const C = 3;`,
+      );
+
+      const result = runCLI('src/a.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should fail (Critical) on a 3-node cycle A→B→C→A where at least one edge has top-level usage', () => {
+      // A → B: lazy (inside function)
+      createFixture(
+        'src/a.ts',
+        `import { b } from './b';
+         export function useB() { return b(); }
+         export const A = 1;`,
+      );
+      // B → C: lazy (inside function)
+      createFixture(
+        'src/b.ts',
+        `import { c } from './c';
+         export function b() { return c(); }
+         export const B = 2;`,
+      );
+      // C → A: CRITICAL — top-level usage of A
+      createFixture(
+        'src/c.ts',
+        `import { A } from './a';
+         export const C = A + 10; // top-level execution`,
+      );
+
+      const result = runCLI('src/a.ts');
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Critical circular dependencies detected');
+    });
+  });
+
+  describe('7. Class & Decorator Scope Rules', () => {
+    beforeEach(() => {
+      createFixture('tsconfig.json', '{}');
+    });
+
+    it('should fail (Critical) when a static class property uses an imported token at top-level', () => {
+      // Static properties are evaluated at class definition time (top-level scope)
+      createFixture(
+        'src/index.ts',
+        `import { value } from './b';
+         export class Config {
+           static LIMIT = value; // static property = top-level execution
+         }
+         export const A = 1;`,
+      );
+      createFixture('src/b.ts', "import { A } from './index'; export const value = 42;");
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Critical circular dependencies detected');
+    });
+
+    it('should pass (Clean) when an imported token is used only inside a constructor body (lazy)', () => {
+      // Constructor bodies are deferred — only executed upon `new ClassName()`
+      createFixture(
+        'src/index.ts',
+        `import { value } from './b';
+         export class Service {
+           private data: number;
+           constructor() {
+             this.data = value; // constructor = lazy scope
+           }
+         }
+         export const A = 1;`,
+      );
+      createFixture('src/b.ts', "import { A } from './index'; export const value = 42;");
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should pass (Clean) when an imported token is used only inside a non-static class property (lazy)', () => {
+      createFixture(
+        'src/index.ts',
+        `import { value } from './b';
+         export class Widget {
+           label = value; // non-static instance property = lazy
+         }
+         export const A = 1;`,
+      );
+      createFixture('src/b.ts', "import { A } from './index'; export const value = 99;");
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+  });
+
+  describe('8. Edge Cases & Resilience', () => {
+    it('should pass (Clean) when entry file is empty', () => {
+      createFixture('tsconfig.json', '{}');
+      createFixture('src/empty.ts', ''); // no imports, no exports
+
+      const result = runCLI('src/empty.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should still work without a tsconfig.json present (graceful fallback)', () => {
+      // No tsconfig.json created — tool should use empty compiler options
+      createFixture('src/index.ts', "import { b } from './b';");
+      createFixture('src/b.ts', 'export const b = 1;');
+
+      const result = runCLI('src/index.ts');
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('✅');
+    });
+
+    it('should exit with code 1 and error message when no arguments are provided', () => {
+      const result = runCLI('');
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('Error:');
+    });
+
+    it('should exit with code 1 when the specified entry file does not exist', () => {
+      createFixture('tsconfig.json', '{}');
+
+      const result = runCLI('src/nonexistent.ts');
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('No entry files found');
+    });
+  });
+
   describe('4. Complex Monorepo & Build Artifact Mapping Fallbacks', () => {
     it('should successfully map compiled assets (.js/.d.ts) inside dist back to src to find cross-package cycles', () => {
       createFixture(
