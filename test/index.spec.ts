@@ -526,4 +526,37 @@ describe('Circular Dependency Detector CLI — Comprehensive Suite', () => {
       expect(result.stderr).toContain('Found 1 critical circular dependencies');
     });
   });
+
+  describe('Execution-Aware Slicing Logic', () => {
+    it('should correctly handle block-scoped variable shadowing and ignore safe localized name collisions', () => {
+      createFixture('tsconfig.json', '{}');
+
+      createFixture(
+        'a.ts',
+        `import { bFunc } from './b';
+    
+    export function aFunc() {
+      bFunc();
+    }
+    
+    for (const bFunc of ['safe-local-context-value']) {
+      console.log(bFunc);
+    }`,
+      );
+
+      createFixture(
+        'b.ts',
+        `import { aFunc } from './a';
+    
+    export function bFunc() {
+      aFunc();
+    }`,
+      );
+
+      const result = runCLI('a.ts');
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain('No critical circular dependencies found');
+    });
+  });
 });

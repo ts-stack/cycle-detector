@@ -82,14 +82,12 @@ function getCompilerOptionsForFile(filePath: string): ts.CompilerOptions {
 function convertToSourcePath(resolvedPath: string): string {
   const isBuildDir = new RegExp(String.raw`[\\/](dist|build|lib|out|cjs|esm|bin)[\\/]`, 'i');
 
-  // If it's already a source file and not trapped inside a known build directory, return it directly
   if (/\.(ts|tsx|mts|cts)$/.test(resolvedPath) && !isBuildDir.test(resolvedPath)) {
     return resolvedPath;
   }
 
   const extensions = ['.ts', '.tsx', '.mts', '.cts'];
 
-  // Strip execution/declaration extensions to get the base file signature
   let baseName = resolvedPath;
   if (baseName.endsWith('.d.ts')) baseName = baseName.slice(0, -5);
   else if (baseName.endsWith('.d.mts')) baseName = baseName.slice(0, -6);
@@ -99,20 +97,17 @@ function convertToSourcePath(resolvedPath: string): string {
   else if (baseName.endsWith('.cjs')) baseName = baseName.slice(0, -4);
   else if (baseName.endsWith('.jsx')) baseName = baseName.slice(0, -4);
 
-  // Strategy 1: Direct Extension Swap (In-place builds or matching structures)
   for (const ext of extensions) {
     if (fs.existsSync(baseName + ext)) return baseName + ext;
   }
 
-  // Strategy 2: Adaptive Path Segment Replacement (Remaps build directories to source directories)
   const buildDirs = ['dist', 'build', 'lib', 'out', 'cjs', 'esm', 'bin'];
-  const srcDirs = ['src', 'source', '.']; // '.' fallback for flat root architectures
+  const srcDirs = ['src', 'source', '.'];
 
   for (const bDir of buildDirs) {
     const regex = new RegExp(String.raw`([\\/])${bDir}([\\/])`, 'i');
     if (regex.test(baseName)) {
       for (const sDir of srcDirs) {
-        // Skip illegal mappings that loop 'lib' back onto 'lib'
         if (bDir.toLowerCase() === sDir.toLowerCase()) continue;
 
         const replacedBase = baseName.replace(regex, `$1${sDir}$2`);
@@ -123,7 +118,6 @@ function convertToSourcePath(resolvedPath: string): string {
     }
   }
 
-  // Strategy 3: Boundary-driven subpath mapping via closest package.json
   let currentDir = path.dirname(resolvedPath);
   while (currentDir && currentDir !== path.parse(currentDir).root) {
     if (fs.existsSync(path.join(currentDir, 'package.json'))) {
@@ -134,7 +128,6 @@ function convertToSourcePath(resolvedPath: string): string {
           const pathParts = relativeToPackage.split(path.sep);
 
           if (pathParts.length > 1) {
-            // Drop the first segment (which is the output folder like 'dist' or 'lib')
             const subPath = pathParts.slice(1).join(path.sep);
             for (const ext of extensions) {
               const targetFile = path.join(srcDirPath, subPath + ext);
@@ -157,15 +150,12 @@ function resolveModule(moduleName: string, containingFile: string, options: ts.C
 
   const resolvedFileName = path.resolve(result.resolvedModule.resolvedFileName);
 
-  // Run universal mapping first: dist/*.d.ts -> src/*.ts
   let sourcePath = resolvedSourceCache.get(resolvedFileName);
   if (sourcePath === undefined) {
     sourcePath = convertToSourcePath(resolvedFileName);
     resolvedSourceCache.set(resolvedFileName, sourcePath);
   }
 
-  // Safety filter: Ignore true external node_modules.
-  // Symlinked monorepo packages will successfully map to their local paths above and bypass this check.
   if (sourcePath.includes(`${path.sep}node_modules${path.sep}`)) {
     return null;
   }
@@ -188,7 +178,6 @@ function getCanonicalCycleKey(cycle: string[]): string {
 }
 
 function parseFile(startPath: string, graph: Map<string, string[]>) {
-  // Iterative DFS to avoid stack overflow on deeply nested dependency trees
   const queue = [startPath];
 
   while (queue.length > 0) {
@@ -224,7 +213,6 @@ function parseFile(startPath: string, graph: Map<string, string[]>) {
     walk(sourceFile);
     graph.set(filePath, imports);
 
-    // Push unvisited dependencies onto the queue
     for (const dep of imports) {
       if (!graph.has(dep)) queue.push(dep);
     }
@@ -295,6 +283,52 @@ function getExportedHoistedFunctions(filePath: string): Set<string> {
   return hoisted;
 }
 
+function collectBindingPattern(pattern: ts.BindingPattern, names: Set<string>) {
+  for (const element of pattern.elements) {
+    if (ts.isOmittedExpression(element)) continue;
+    if (ts.isIdentifier(element.name)) {
+      names.add(element.name.text);
+    } else if (ts.isObjectBindingPattern(element.name) || ts.isArrayBindingPattern(element.name)) {
+      collectBindingPattern(element.name, names);
+    }
+  }
+}
+
+function getLocalDeclarations(node: ts.Node): Set<string> {
+  const names = new Set<string>();
+
+  function collect(n: ts.Node) {
+    if (ts.isVariableDeclaration(n) || ts.isParameter(n)) {
+      if (ts.isIdentifier(n.name)) {
+        names.add(n.name.text);
+      } else if (ts.isObjectBindingPattern(n.name) || ts.isArrayBindingPattern(n.name)) {
+        collectBindingPattern(n.name, names);
+      }
+    } else if (ts.isFunctionDeclaration(n) && n.name) {
+      names.add(n.name.text);
+    } else if (ts.isClassDeclaration(n) && n.name) {
+      names.add(n.name.text);
+    }
+
+    if (
+      ts.isBlock(n) ||
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n)
+    ) {
+      return;
+    }
+    ts.forEachChild(n, collect);
+  }
+
+  ts.forEachChild(node, collect);
+  return names;
+}
+
 function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
   if (!fs.existsSync(fromFile)) return false;
 
@@ -338,14 +372,12 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
                 } else if (ts.isNamedImports(clause.namedBindings)) {
                   for (const el of clause.namedBindings.elements) {
                     if (el.isTypeOnly) continue;
-
                     const exportedName = el.propertyName ? el.propertyName.text : el.name.text;
                     localToExportedName.set(el.name.text, exportedName);
                   }
                 }
               }
             } else {
-              // Side-effect import OR export ... from '...' (re-export) — always top-level
               hasSideEffectOrReExport = true;
             }
           }
@@ -368,10 +400,31 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
 
   let dangerousTopLevelUsage = false;
 
-  function checkNodeUsage(node: ts.Node, isInsideLazyScope: boolean) {
+  function checkNodeUsage(node: ts.Node, isInsideLazyScope: boolean, shadowedSymbols: Set<string>) {
     if (dangerousTopLevelUsage) return;
 
     let currentScopeLazy = isInsideLazyScope;
+    let currentShadowed = shadowedSymbols;
+
+    if (
+      ts.isSourceFile(node) ||
+      ts.isBlock(node) ||
+      ts.isForStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isForInStatement(node) ||
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)
+    ) {
+      const localDecls = getLocalDeclarations(node);
+      if (localDecls.size > 0) {
+        currentShadowed = new Set([...shadowedSymbols, ...localDecls]);
+      }
+    }
 
     if (
       ts.isFunctionDeclaration(node) ||
@@ -391,6 +444,10 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
     }
 
     if (!currentScopeLazy && ts.isIdentifier(node)) {
+      if (currentShadowed.has(node.text)) {
+        return;
+      }
+
       const isImportedSymbol = localToExportedName.has(node.text);
       const isNamespaceReference = namespaceImportName && node.text === namespaceImportName;
 
@@ -451,10 +508,10 @@ function hasTopLevelUsage(fromFile: string, toFile: string): boolean {
       }
     }
 
-    ts.forEachChild(node, (n) => checkNodeUsage(n, currentScopeLazy));
+    ts.forEachChild(node, (n) => checkNodeUsage(n, currentScopeLazy, currentShadowed));
   }
 
-  checkNodeUsage(sourceFile, false);
+  checkNodeUsage(sourceFile, false, new Set<string>());
   topLevelUsageCache.set(cacheKey, dangerousTopLevelUsage);
   return dangerousTopLevelUsage;
 }
@@ -483,11 +540,9 @@ function main() {
     process.exit(1);
   }
 
-  // All mutable state is local to each run — no cross-run contamination
   const graph = new Map<string, string[]>();
   const allUniqueCycles: string[][] = [];
   const globalDetectedCycles = new Set<string>();
-
   const entryPoints: string[] = [];
 
   for (const pattern of entryPatterns) {
@@ -595,11 +650,12 @@ function main() {
 
       cycles.forEach((cycle, index) => {
         console.error(`  ${index + 1})`, '-'.repeat(80));
-        for (let i = 1; i < cycle.length; i++) {
-          const nextFile = i === cycle.length - 1 ? cycle[1] : cycle[i + 1];
-          const isTopLevel = hasTopLevelUsage(cycle[i], nextFile);
+        for (let i = 0; i < cycle.length - 1; i++) {
+          const currentFile = cycle[i];
+          const nextFile = cycle[i + 1];
+          const isTopLevel = hasTopLevelUsage(currentFile, nextFile);
           const prefix = isTopLevel ? '  💥 [Top-level] ' : '  ⏳ [Lazy]      ';
-          console.error(`${prefix}${path.resolve(cycle[i])}`);
+          console.error(`${prefix}${path.resolve(currentFile)}`);
         }
       });
       console.error('');
